@@ -337,7 +337,6 @@ button {
   pointer-events: none;
 }
 
-.brand-card,
 .connection-form,
 .schema-card,
 .switcher-card,
@@ -640,6 +639,10 @@ select:focus {
 .switcher-list {
   display: grid;
   gap: 8px;
+}
+
+.switcher-summary {
+  margin-top: 4px;
 }
 
 .switcher-item {
