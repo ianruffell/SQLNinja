@@ -1,0 +1,24 @@
+<svg width="128" height="128" viewBox="0 0 128 128" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg" x1="18" y1="12" x2="110" y2="116" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#111827"/>
+      <stop offset="1" stop-color="#020617"/>
+    </linearGradient>
+    <linearGradient id="stroke" x1="34" y1="24" x2="92" y2="104" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#B9F3FF"/>
+      <stop offset="1" stop-color="#38BDF8"/>
+    </linearGradient>
+    <linearGradient id="blade" x1="76" y1="26" x2="48" y2="108" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#F8FAFC"/>
+      <stop offset="1" stop-color="#7DD3FC"/>
+    </linearGradient>
+  </defs>
+  <rect x="8" y="8" width="112" height="112" rx="28" fill="url(#bg)"/>
+  <rect x="8.5" y="8.5" width="111" height="111" rx="27.5" stroke="rgba(255,255,255,0.18)"/>
+  <ellipse cx="52" cy="36" rx="24" ry="10" stroke="url(#stroke)" stroke-width="6"/>
+  <path d="M28 36V72C28 77.5228 38.7452 82 52 82C65.2548 82 76 77.5228 76 72V36" stroke="url(#stroke)" stroke-width="6"/>
+  <ellipse cx="52" cy="72" rx="24" ry="10" stroke="url(#stroke)" stroke-width="6"/>
+  <path d="M82 28L60 102" stroke="url(#blade)" stroke-width="10" stroke-linecap="round"/>
+  <path d="M78 52H96" stroke="url(#blade)" stroke-width="8" stroke-linecap="round"/>
+  <circle cx="92" cy="92" r="7" fill="#38BDF8"/>
+</svg>
