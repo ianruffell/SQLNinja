@@ -46,6 +46,7 @@ export function createWorkspaceState(snapshot?: PersistedWorkspaceState): Worksp
   return {
     schema: null,
     databases: [],
+    contextLabel: "Database",
     selectedDatabase:
       typeof snapshot?.selectedDatabase === "string" && snapshot.selectedDatabase ? snapshot.selectedDatabase : null,
     tabs: tabs.length > 0 ? tabs : [firstTab],
@@ -54,14 +55,16 @@ export function createWorkspaceState(snapshot?: PersistedWorkspaceState): Worksp
         ? snapshot.activeTabId
         : firstTab.id,
     connectionStatus: "idle",
-    connectionMessage: "Open a workspace to discover databases on this server.",
+    connectionMessage: "Open a workspace to discover available databases or schemas for this connection.",
     aiCollapsed: false,
     aiModels: [],
     aiSelectedModel: null,
+    aiBaseUrl: null,
     aiPrompt: "",
     aiStatus: "idle",
-    aiMessage: "Connect to Ollama to generate or optimize SQL with AI.",
+    aiMessage: "Connect to Ollama to generate or refine SQL with AI.",
     aiNotes: "",
+    aiHistory: [],
   };
 }
 

@@ -1,8 +1,12 @@
+export type DatabaseType = "mysql" | "mariadb" | "postgres" | "oracle" | "sqlserver" | "ignite";
+
 export type ConnectionConfig = {
+  type: DatabaseType;
   host: string;
   port: number;
   user: string;
   password: string;
+  database?: string;
 };
 
 export type SavedConnection = ConnectionConfig & {
@@ -21,6 +25,7 @@ export type SchemaNode = {
 
 export type SchemaPayload = {
   databases: string[];
+  contextLabel: string;
   tree: SchemaNode;
 };
 
@@ -66,9 +71,16 @@ export type NotebookTab = {
 
 export type ConnectionStatus = "idle" | "loading" | "ready" | "error";
 
+export type AiAssistantTurn = {
+  prompt: string;
+  sql: string;
+  notes: string;
+};
+
 export type WorkspaceState = {
   schema: SchemaNode | null;
   databases: string[];
+  contextLabel: string;
   selectedDatabase: string | null;
   tabs: NotebookTab[];
   activeTabId: string | null;
@@ -77,18 +89,22 @@ export type WorkspaceState = {
   aiCollapsed: boolean;
   aiModels: string[];
   aiSelectedModel: string | null;
+  aiBaseUrl: string | null;
   aiPrompt: string;
   aiStatus: ConnectionStatus;
   aiMessage: string;
   aiNotes: string;
+  aiHistory: AiAssistantTurn[];
 };
 
 export type ConnectionDraft = {
   name: string;
+  type: DatabaseType;
   host: string;
   port: number;
   user: string;
   password: string;
+  database: string;
 };
 
 export type DraftTestState = {

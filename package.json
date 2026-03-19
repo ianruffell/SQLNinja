@@ -13,10 +13,14 @@
     "rest:import": "tsx cli/rest-import.ts"
   },
   "dependencies": {
+    "apache-ignite-client": "^1.0.0",
     "cors": "^2.8.5",
     "dotenv": "^16.6.1",
     "express": "^5.1.0",
+    "mssql": "^12.2.1",
     "mysql2": "^3.15.3",
+    "oracledb": "^6.10.0",
+    "pg": "^8.20.0",
     "react": "^19.2.0",
     "react-dom": "^19.2.0",
     "zod": "^4.1.12"

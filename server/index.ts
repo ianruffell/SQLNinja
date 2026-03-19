@@ -1,23 +1,64 @@
 import "dotenv/config";
 import cors from "cors";
 import express from "express";
+import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { RowDataPacket, createPool } from "mysql2/promise";
 import { z } from "zod";
+import {
+  ConnectionInput,
+  DatabaseType,
+  discoverSchema,
+  executeSql,
+  getDialectLabel,
+  testConnection,
+} from "./database.js";
 
 const app = express();
 const port = Number(process.env.PORT ?? 8787);
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
-const clientDistPath = join(__dirname, "../client");
-const SYSTEM_DATABASES = ["information_schema", "mysql", "performance_schema", "sys"];
-const ollamaBaseUrl = (process.env.OLLAMA_BASE_URL ?? "http://127.0.0.1:11434").replace(/\/+$/, "");
+const defaultOllamaBaseUrl = "http://127.0.0.1:11434";
+
+function resolveOllamaBaseUrl() {
+  const configuredValue = process.env.OLLAMA_HOST?.trim() || process.env.OLLAMA_BASE_URL?.trim();
+  if (!configuredValue) {
+    return defaultOllamaBaseUrl;
+  }
+
+  const candidate = /^[a-z][a-z\d+\-.]*:\/\//i.test(configuredValue)
+    ? configuredValue
+    : `http://${configuredValue}`;
+
+  try {
+    const normalized = new URL(candidate);
+    return normalized.toString().replace(/\/+$/, "");
+  } catch {
+    console.warn(
+      `Invalid Ollama host configuration "${configuredValue}". Falling back to ${defaultOllamaBaseUrl}.`,
+    );
+    return defaultOllamaBaseUrl;
+  }
+}
+
+const ollamaBaseUrl = resolveOllamaBaseUrl();
+
+const clientDistPathCandidates = [
+  join(__dirname, "../client"),
+  join(process.cwd(), "dist/client"),
+];
+const clientDistPath = clientDistPathCandidates.find((candidate) => existsSync(join(candidate, "index.html"))) ?? null;
 
 app.use(cors());
 app.use(express.json({ limit: "1mb" }));
 
-const databaseSchema = z.preprocess(
+if (clientDistPath) {
+  app.use(express.static(clientDistPath));
+}
+
+const databaseTypeSchema = z.enum(["mysql", "mariadb", "postgres", "oracle", "sqlserver", "ignite"]);
+
+const optionalNameSchema = z.preprocess(
   (value) => {
     if (typeof value !== "string") {
       return undefined;
@@ -29,41 +70,56 @@ const databaseSchema = z.preprocess(
   z.string().min(1).optional(),
 );
 
-const connectionSchema = z.object({
-  host: z.string().trim().min(1),
-  port: z.coerce.number().int().positive().max(65535).catch(3306),
-  user: z.string().trim().min(1),
-  password: z.string().catch(""),
-  database: databaseSchema,
-});
+const connectionSchema = z
+  .object({
+    type: databaseTypeSchema,
+    host: z.string().trim().min(1),
+    port: z.coerce.number().int().positive().max(65535),
+    user: z.string().trim().default(""),
+    password: z.string().catch(""),
+    database: optionalNameSchema,
+    selectedDatabase: optionalNameSchema,
+  })
+  .superRefine((input, context) => {
+    if (input.type !== "ignite" && input.user.trim().length === 0) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["user"],
+        message: "User is required for this database type.",
+      });
+    }
+
+    if (input.type === "oracle" && !input.database) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["database"],
+        message: "Oracle connections require a service name.",
+      });
+    }
+  });
 
 const sqlSchema = connectionSchema.extend({
-  sql: z.string().min(1),
+  sql: z.string().trim().min(1),
 });
 
 const aiRequestSchema = z.object({
   model: z.string().trim().min(1),
-  selectedDatabase: databaseSchema,
+  databaseType: databaseTypeSchema,
+  selectedDatabase: optionalNameSchema,
   schemaSummary: z.string().trim().max(25000).default(""),
   prompt: z.string().trim().max(8000).default(""),
   sql: z.string().trim().max(40000).optional(),
+  history: z
+    .array(
+      z.object({
+        prompt: z.string().trim().max(8000).default(""),
+        sql: z.string().trim().max(40000).default(""),
+        notes: z.string().trim().max(4000).default(""),
+      }),
+    )
+    .max(6)
+    .default([]),
 });
-
-type ConnectionInput = z.infer<typeof connectionSchema>;
-
-type SchemaNode = {
-  id: string;
-  label: string;
-  type: "database" | "group" | "table" | "view" | "column" | "index";
-  description?: string;
-  reference?: string;
-  children?: SchemaNode[];
-};
-
-type SchemaResponse = {
-  databases: string[];
-  tree: SchemaNode;
-};
 
 type AiOperation = "generate" | "optimize";
 
@@ -79,363 +135,6 @@ type OllamaChatResponse = {
     content?: string;
   };
 };
-
-type SchemaRecord = RowDataPacket & {
-  schemaName: string;
-};
-
-type ColumnRecord = RowDataPacket & {
-  schemaName: string;
-  tableName: string;
-  columnName: string;
-  columnType: string;
-  isNullable: "YES" | "NO";
-  columnKey: string | null;
-  columnDefault: string | null;
-  extra: string | null;
-};
-
-type TableRecord = RowDataPacket & {
-  schemaName: string;
-  tableName: string;
-  tableType: string;
-  tableComment: string | null;
-};
-
-type IndexRecord = RowDataPacket & {
-  schemaName: string;
-  tableName: string;
-  indexName: string;
-  columnName: string;
-  isUnique: number;
-};
-
-function getPool(input: ConnectionInput) {
-  return createPool({
-    host: input.host,
-    port: input.port,
-    user: input.user,
-    password: input.password,
-    database: input.database,
-    waitForConnections: false,
-    connectionLimit: 4,
-    queueLimit: 0,
-    namedPlaceholders: true,
-    multipleStatements: true,
-  });
-}
-
-async function listDatabases(pool: ReturnType<typeof getPool>) {
-  const placeholders = SYSTEM_DATABASES.map(() => "?").join(", ");
-  const [rows] = await pool.query<SchemaRecord[]>(
-    `
-      SELECT SCHEMA_NAME AS schemaName
-      FROM INFORMATION_SCHEMA.SCHEMATA
-      WHERE SCHEMA_NAME NOT IN (${placeholders})
-      ORDER BY SCHEMA_NAME
-    `,
-    SYSTEM_DATABASES,
-  );
-
-  return rows.map((row) => row.schemaName);
-}
-
-function createPlaceholders(count: number) {
-  return Array.from({ length: count }, () => "?").join(", ");
-}
-
-async function discoverSchema(input: ConnectionInput): Promise<SchemaResponse> {
-  const pool = getPool(input);
-
-  try {
-    const databases = await listDatabases(pool);
-    if (databases.length === 0) {
-      return {
-        databases: [],
-        tree: {
-          id: `instance:${input.host}:${input.port}`,
-          label: `${input.host}:${input.port}`,
-          type: "group",
-          children: [],
-        },
-      };
-    }
-
-    const placeholders = createPlaceholders(databases.length);
-
-    const [tables] = await pool.query<TableRecord[]>(
-      `
-        SELECT
-          TABLE_SCHEMA AS schemaName,
-          TABLE_NAME AS tableName,
-          TABLE_TYPE AS tableType,
-          TABLE_COMMENT AS tableComment
-        FROM INFORMATION_SCHEMA.TABLES
-        WHERE TABLE_SCHEMA IN (${placeholders})
-        ORDER BY TABLE_SCHEMA, TABLE_TYPE, TABLE_NAME
-      `,
-      databases,
-    );
-
-    const [columns] = await pool.query<ColumnRecord[]>(
-      `
-        SELECT
-          TABLE_SCHEMA AS schemaName,
-          TABLE_NAME AS tableName,
-          COLUMN_NAME AS columnName,
-          COLUMN_TYPE AS columnType,
-          IS_NULLABLE AS isNullable,
-          COLUMN_KEY AS columnKey,
-          COLUMN_DEFAULT AS columnDefault,
-          EXTRA AS extra
-        FROM INFORMATION_SCHEMA.COLUMNS
-        WHERE TABLE_SCHEMA IN (${placeholders})
-        ORDER BY TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION
-      `,
-      databases,
-    );
-
-    const [indexes] = await pool.query<IndexRecord[]>(
-      `
-        SELECT
-          TABLE_SCHEMA AS schemaName,
-          TABLE_NAME AS tableName,
-          INDEX_NAME AS indexName,
-          COLUMN_NAME AS columnName,
-          NON_UNIQUE AS isUnique
-        FROM INFORMATION_SCHEMA.STATISTICS
-        WHERE TABLE_SCHEMA IN (${placeholders})
-        ORDER BY TABLE_SCHEMA, TABLE_NAME, INDEX_NAME, SEQ_IN_INDEX
-      `,
-      databases,
-    );
-
-    const columnsByTable = groupBy(columns, (item) => `${item.schemaName}.${item.tableName}`);
-    const indexesByTable = groupBy(indexes, (item) => `${item.schemaName}.${item.tableName}`);
-    const tablesByDatabase = groupBy(tables, (item) => item.schemaName);
-
-    return {
-      databases,
-      tree: {
-        id: `instance:${input.host}:${input.port}`,
-        label: `${input.host}:${input.port}`,
-        type: "group",
-        children: databases.map((databaseName) =>
-          buildDatabaseNode(
-            databaseName,
-            tablesByDatabase[databaseName] ?? [],
-            columnsByTable,
-            indexesByTable,
-          ),
-        ),
-      },
-    };
-  } finally {
-    await pool.end();
-  }
-}
-
-async function testConnection(input: ConnectionInput) {
-  const pool = getPool(input);
-
-  try {
-    const [rows] = await pool.query<RowDataPacket[]>(
-      `
-        SELECT
-          DATABASE() AS databaseName,
-          VERSION() AS serverVersion
-      `,
-    );
-
-    const databases = await listDatabases(pool);
-    const firstRow = rows[0];
-
-    return {
-      databaseName: typeof firstRow?.databaseName === "string" ? firstRow.databaseName : null,
-      serverVersion:
-        typeof firstRow?.serverVersion === "string" ? firstRow.serverVersion : "unknown",
-      databases,
-    };
-  } finally {
-    await pool.end();
-  }
-}
-
-function groupBy<T>(items: T[], keySelector: (item: T) => string) {
-  return items.reduce<Record<string, T[]>>((acc, item) => {
-    const key = keySelector(item);
-    acc[key] ??= [];
-    acc[key].push(item);
-    return acc;
-  }, {});
-}
-
-function buildDatabaseNode(
-  databaseName: string,
-  tables: TableRecord[],
-  columnsByTable: Record<string, ColumnRecord[]>,
-  indexesByTable: Record<string, IndexRecord[]>,
-): SchemaNode {
-  const tableNodes = tables
-    .filter((item) => item.tableType === "BASE TABLE")
-    .map((table) => buildTableNode(table, columnsByTable, indexesByTable));
-
-  const viewNodes = tables
-    .filter((item) => item.tableType !== "BASE TABLE")
-    .map((table) => buildTableNode(table, columnsByTable, indexesByTable));
-
-  return {
-    id: `database:${databaseName}`,
-    label: databaseName,
-    type: "database",
-    reference: `\`${databaseName}\``,
-    children: [
-      {
-        id: `group:${databaseName}:tables`,
-        label: `Tables (${tableNodes.length})`,
-        type: "group",
-        children: tableNodes,
-      },
-      {
-        id: `group:${databaseName}:views`,
-        label: `Views (${viewNodes.length})`,
-        type: "group",
-        children: viewNodes,
-      },
-    ],
-  };
-}
-
-function buildTableNode(
-  table: TableRecord,
-  columnsByTable: Record<string, ColumnRecord[]>,
-  indexesByTable: Record<string, IndexRecord[]>,
-): SchemaNode {
-  const tableKey = `${table.schemaName}.${table.tableName}`;
-  const tableReference = `\`${table.schemaName}\`.\`${table.tableName}\``;
-  const columnNodes = (columnsByTable[tableKey] ?? []).map((column) => {
-    const traits = [
-      column.columnType,
-      column.isNullable === "NO" ? "not null" : "nullable",
-      column.columnKey || null,
-      column.extra || null,
-    ].filter(Boolean);
-
-    return {
-      id: `column:${table.schemaName}:${table.tableName}:${column.columnName}`,
-      label: column.columnName,
-      type: "column" as const,
-      description: traits.join(" | "),
-      reference: `${tableReference}.\`${column.columnName}\``,
-    };
-  });
-
-  const indexMap = new Map<string, IndexRecord[]>();
-  for (const index of indexesByTable[tableKey] ?? []) {
-    const existing = indexMap.get(index.indexName) ?? [];
-    existing.push(index);
-    indexMap.set(index.indexName, existing);
-  }
-
-  const indexNodes = Array.from(indexMap.entries()).map(([indexName, records]) => ({
-    id: `index:${table.schemaName}:${table.tableName}:${indexName}`,
-    label: indexName,
-    type: "index" as const,
-    description: `${records[0]?.isUnique === 0 ? "non-unique" : "unique"} | ${records
-      .map((record) => record.columnName)
-      .join(", ")}`,
-  }));
-
-  return {
-    id: `${table.tableType === "BASE TABLE" ? "table" : "view"}:${table.schemaName}:${table.tableName}`,
-    label: table.tableName,
-    type: table.tableType === "BASE TABLE" ? "table" : "view",
-    description: table.tableComment || undefined,
-    reference: tableReference,
-    children: [
-      {
-        id: `group:${table.schemaName}:${table.tableName}:columns`,
-        label: `Columns (${columnNodes.length})`,
-        type: "group",
-        children: columnNodes,
-      },
-      {
-        id: `group:${table.schemaName}:${table.tableName}:indexes`,
-        label: `Indexes (${indexNodes.length})`,
-        type: "group",
-        children: indexNodes,
-      },
-    ],
-  };
-}
-
-function normalizeQueryResult(result: unknown) {
-  if (Array.isArray(result)) {
-    if (result.length === 0) {
-      return {
-        kind: "result-set" as const,
-        columns: [] as string[],
-        rows: [] as Record<string, unknown>[],
-        rowCount: 0,
-      };
-    }
-
-    if (typeof result[0] === "object" && result[0] !== null && !Array.isArray(result[0])) {
-      const rows = result as Record<string, unknown>[];
-      const columns = Object.keys(rows[0] ?? {});
-      return {
-        kind: "result-set" as const,
-        columns,
-        rows,
-        rowCount: rows.length,
-      };
-    }
-  }
-
-  if (typeof result === "object" && result !== null) {
-    const info = result as {
-      affectedRows?: number;
-      insertId?: number;
-      warningStatus?: number;
-    };
-
-    return {
-      kind: "command" as const,
-      affectedRows: info.affectedRows ?? 0,
-      insertId: info.insertId ?? null,
-      warningStatus: info.warningStatus ?? 0,
-    };
-  }
-
-  return {
-    kind: "unknown" as const,
-    value: result,
-  };
-}
-
-function isCommandPacket(value: unknown) {
-  return (
-    typeof value === "object" &&
-    value !== null &&
-    ("affectedRows" in value || "insertId" in value || "warningStatus" in value || "fieldCount" in value)
-  );
-}
-
-function normalizeStatementResults(rawResults: unknown) {
-  if (!Array.isArray(rawResults)) {
-    return [normalizeQueryResult(rawResults)];
-  }
-
-  if (rawResults.length === 0) {
-    return [normalizeQueryResult(rawResults)];
-  }
-
-  if (Array.isArray(rawResults[0]) || isCommandPacket(rawResults[0])) {
-    return rawResults.map((item) => normalizeQueryResult(item));
-  }
-
-  return [normalizeQueryResult(rawResults)];
-}
 
 async function fetchOllamaJson<T>(path: string, init?: RequestInit) {
   const response = await fetch(`${ollamaBaseUrl}${path}`, init);
@@ -460,38 +159,59 @@ async function listOllamaModels() {
     .filter((name) => name.length > 0);
 }
 
-function buildAiSystemPrompt(operation: AiOperation) {
+function buildAiSystemPrompt(operation: AiOperation, databaseType: DatabaseType) {
+  const dialectLabel = getDialectLabel(databaseType);
+
   if (operation === "generate") {
     return [
-      "You are a senior SQL assistant for MariaDB and MySQL.",
+      `You are a senior SQL assistant for ${dialectLabel}.`,
       "Generate a syntactically valid SQL query or set of queries based on the user request.",
+      "When prior SQL or earlier assistant context is provided, treat the latest request as an iteration on that work unless the user asks to start over.",
+      "Match the target dialect's quoting, built-ins, and catalog conventions.",
       "Prefer explicit column names when reasonable, avoid unsafe destructive statements unless the user clearly asks for them.",
-      "Respond only as JSON with keys: sql, notes.",
-      "notes must be a short plain-English explanation.",
+      'Respond only as JSON with keys: sql, notes. notes must be a short plain-English explanation.',
     ].join(" ");
   }
 
   return [
-    "You are a senior SQL performance assistant for MariaDB and MySQL.",
+    `You are a senior SQL performance assistant for ${dialectLabel}.`,
     "Optimize the provided SQL while preserving behavior unless the user request explicitly allows semantic changes.",
+    "Keep the rewritten SQL valid for the same dialect.",
     "Favor readable SQL, reduced unnecessary work, and better join/filter placement.",
-    "Respond only as JSON with keys: sql, notes.",
-    "notes must briefly explain the optimization decisions and any assumptions.",
+    'Respond only as JSON with keys: sql, notes. notes must briefly explain the optimization decisions and any assumptions.',
   ].join(" ");
 }
 
-function buildAiUserPrompt(
-  operation: AiOperation,
-  input: z.infer<typeof aiRequestSchema>,
-) {
+function buildAiUserPrompt(operation: AiOperation, input: z.infer<typeof aiRequestSchema>) {
   const sections = [
-    operation === "generate" ? "Task: Generate SQL from a natural-language request." : "Task: Optimize an existing SQL query.",
-    `Selected database: ${input.selectedDatabase ?? "none"}`,
+    operation === "generate"
+      ? "Task: Generate SQL from a natural-language request or revise the current SQL using the latest feedback."
+      : "Task: Optimize an existing SQL query.",
+    `Target dialect: ${getDialectLabel(input.databaseType)}`,
+    `Selected context: ${input.selectedDatabase ?? "none"}`,
     `Schema summary:\n${input.schemaSummary || "No schema summary provided."}`,
   ];
 
+  if (input.sql) {
+    sections.push(`Current working SQL:\n${input.sql}`);
+  }
+
+  if (input.history.length > 0) {
+    sections.push(
+      `Previous assistant context:\n${input.history
+        .map((turn, index) =>
+          [
+            `Iteration ${index + 1} request: ${turn.prompt || "No prompt recorded."}`,
+            `Iteration ${index + 1} SQL:\n${turn.sql || "No SQL recorded."}`,
+            `Iteration ${index + 1} notes: ${turn.notes || "No notes recorded."}`,
+          ].join("\n"),
+        )
+        .join("\n\n")}`,
+    );
+  }
+
   if (operation === "generate") {
-    sections.push(`User request:\n${input.prompt || "No prompt provided."}`);
+    sections.push(`Latest user request:\n${input.prompt || "No prompt provided."}`);
   } else {
     sections.push(`Existing SQL:\n${input.sql || ""}`);
     sections.push(`Optimization goal:\n${input.prompt || "Improve performance and readability while preserving behavior."}`);
@@ -530,7 +250,7 @@ async function runAiTask(operation: AiOperation, input: z.infer<typeof aiRequest
       messages: [
         {
           role: "system",
-          content: buildAiSystemPrompt(operation),
+          content: buildAiSystemPrompt(operation, input.databaseType),
         },
         {
           role: "user",
@@ -543,52 +263,47 @@ async function runAiTask(operation: AiOperation, input: z.infer<typeof aiRequest
   return parseAiResponse(payload?.message?.content);
 }
 
-app.use(express.static(clientDistPath));
+function parseConnectionInput(body: unknown): ConnectionInput {
+  const parsed = connectionSchema.safeParse(body);
+  if (!parsed.success) {
+    const error = new Error("Invalid connection payload.");
+    (error as Error & { issues?: unknown }).issues = parsed.error.issues;
+    throw error;
+  }
+
+  return parsed.data;
+}
 
 app.get("/api/health", (_request, response) => {
   response.json({ ok: true });
 });
 
 app.post("/api/schema", async (request, response) => {
-  const parsed = connectionSchema.safeParse(request.body);
-  if (!parsed.success) {
-    response.status(400).json({
-      message: "Invalid connection payload.",
-      issues: parsed.error.issues,
-    });
-    return;
-  }
-
   try {
-    const schema = await discoverSchema(parsed.data);
-    response.json(schema);
+    const input = parseConnectionInput(request.body);
+    response.json(await discoverSchema(input));
   } catch (error) {
-    response.status(500).json({
-      message: "Failed to discover schema.",
+    const issues = (error as Error & { issues?: unknown }).issues;
+    response.status(issues ? 400 : 500).json({
+      message: issues ? "Invalid connection payload." : "Failed to discover schema.",
+      issues,
       error: error instanceof Error ? error.message : "Unknown error",
     });
   }
 });
 
 app.post("/api/test-connection", async (request, response) => {
-  const parsed = connectionSchema.safeParse(request.body);
-  if (!parsed.success) {
-    response.status(400).json({
-      message: "Invalid connection payload.",
-      issues: parsed.error.issues,
-    });
-    return;
-  }
-
   try {
-    const result = await testConnection(parsed.data);
+    const input = parseConnectionInput(request.body);
     response.json({
       ok: true,
-      ...result,
+      ...(await testConnection(input)),
     });
   } catch (error) {
-    response.status(500).json({
-      message: "Failed to connect to the database.",
+    const issues = (error as Error & { issues?: unknown }).issues;
+    response.status(issues ? 400 : 500).json({
+      message: issues ? "Invalid connection payload." : "Failed to connect to the database.",
+      issues,
       error: error instanceof Error ? error.message : "Unknown error",
     });
   }
@@ -604,26 +319,13 @@ app.post("/api/query", async (request, response) => {
     return;
   }
 
-  const pool = getPool(parsed.data);
-
   try {
-    const startedAt = performance.now();
-    const [rawResults] = await pool.query(parsed.data.sql);
-    const normalizedResults = normalizeStatementResults(rawResults);
-    const durationMs = Math.round((performance.now() - startedAt) * 100) / 100;
-
-    response.json({
-      statements: normalizedResults,
-      executedAt: new Date().toISOString(),
-      durationMs,
-    });
+    response.json(await executeSql(parsed.data, parsed.data.sql));
   } catch (error) {
     response.status(500).json({
       message: "Failed to execute SQL.",
       error: error instanceof Error ? error.message : "Unknown error",
     });
-  } finally {
-    await pool.end();
   }
 });
 
@@ -636,7 +338,8 @@ app.get("/api/ai/models", async (_request, response) => {
     });
   } catch (error) {
     response.status(502).json({
-      message: "Failed to reach the local Ollama server.",
+      message: "Failed to reach the configured Ollama server.",
+      baseUrl: ollamaBaseUrl,
       error: error instanceof Error ? error.message : "Unknown error",
     });
   }
@@ -653,8 +356,7 @@ app.post("/api/ai/generate-sql", async (request, response) => {
   }
 
   try {
-    const result = await runAiTask("generate", parsed.data);
-    response.json(result);
+    response.json(await runAiTask("generate", parsed.data));
   } catch (error) {
     response.status(502).json({
       message: "Failed to generate SQL with Ollama.",
@@ -674,8 +376,7 @@ app.post("/api/ai/optimize-sql", async (request, response) => {
   }
 
   try {
-    const result = await runAiTask("optimize", parsed.data);
-    response.json(result);
+    response.json(await runAiTask("optimize", parsed.data));
   } catch (error) {
     response.status(502).json({
       message: "Failed to optimize SQL with Ollama.",
@@ -685,6 +386,13 @@ app.post("/api/ai/optimize-sql", async (request, response) => {
 });
 
 app.get("/{*path}", (_request, response) => {
+  if (!clientDistPath) {
+    response.status(404).json({
+      message: "Client bundle not found. Run `npm run dev` for the Vite UI or `npm run build` before `npm start`.",
+    });
+    return;
+  }
+
   response.sendFile(join(clientDistPath, "index.html"));
 });
 

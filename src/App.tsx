@@ -5,6 +5,8 @@ import { NotebookCard } from "./components/NotebookCard";
 import { SchemaTree } from "./components/SchemaTree";
 import {
   formatApiError,
+  getContextLabel,
+  getDatabaseTypeLabel,
   normalizeSavedConnection,
   normalizeSchemaPayload,
   sanitizeDraft,
@@ -37,16 +39,60 @@ import type {
 } from "./types";
 
 const initialConnection = {
+  type: "mariadb" as const,
   host: "127.0.0.1",
   port: 3306,
   user: "root",
   password: "",
+  database: "",
 };
 
 const initialDraft: ConnectionDraft = {
   name: "Local MariaDB",
   ...initialConnection,
 };
+
+function formatOllamaHostLabel(baseUrl: string | null) {
+  if (!baseUrl) {
+    return null;
+  }
+
+  try {
+    return new URL(baseUrl).host || baseUrl;
+  } catch {
+    return baseUrl.replace(/^https?:\/\//, "");
+  }
+}
+
+async function readApiPayload(response: Response) {
+  const contentType = response.headers.get("content-type") ?? "";
+
+  if (contentType.includes("application/json")) {
+    try {
+      return await response.json();
+    } catch {
+      return null;
+    }
+  }
+
+  try {
+    const text = await response.text();
+    return text.trim().length > 0 ? { error: text.trim() } : null;
+  } catch {
+    return null;
+  }
+}
+
+const MAX_AI_HISTORY_ITEMS = 6;
+
+function getAiBaseUrl(payload: unknown) {
+  if (typeof payload !== "object" || payload === null) {
+    return null;
+  }
+
+  const baseUrl = (payload as { baseUrl?: unknown }).baseUrl;
+  return typeof baseUrl === "string" && baseUrl.trim().length > 0 ? baseUrl.trim() : null;
+}
 
 function initializeConnections() {
   return loadConnections()
@@ -181,6 +227,7 @@ export function App() {
 
   function saveConnection() {
     const normalized = sanitizeDraft(draft);
+    const wasEditing = editingId !== null;
     const connectionId = editingId ?? crypto.randomUUID();
     const nextConnection: SavedConnection = {
       id: connectionId,
@@ -196,12 +243,16 @@ export function App() {
     });
 
     setActiveConnectionId(connectionId);
-    setEditingId(connectionId);
-    setDraft(toDraft(nextConnection));
+    if (wasEditing) {
+      setEditingId(connectionId);
+      setDraft(toDraft(nextConnection));
+    } else {
+      resetDraft();
+    }
     updateWorkspace(connectionId, (workspace) => ({
       ...workspace,
       connectionStatus: "idle",
-      connectionMessage: "Connection saved. Test it or open the workspace to discover databases.",
+      connectionMessage: "Connection saved. Test it or open the workspace to discover its structure.",
     }));
     return nextConnection;
   }
@@ -216,7 +267,7 @@ export function App() {
     updateWorkspace(connectionId, (workspace) => ({
       ...workspace,
       connectionStatus: "loading",
-      connectionMessage: `Connecting to ${connection.name} and discovering databases...`,
+      connectionMessage: `Connecting to ${connection.name} and discovering available structure...`,
     }));
 
     try {
@@ -242,12 +293,13 @@ export function App() {
           ...workspace,
           schema: schemaPayload.tree,
           databases: schemaPayload.databases,
+          contextLabel: schemaPayload.contextLabel,
           selectedDatabase,
           connectionStatus: "ready",
           connectionMessage:
             schemaPayload.databases.length > 0
-              ? `Discovered ${schemaPayload.databases.length} database(s) on ${connection.host}.`
-              : "Connected, but no non-system databases were discovered.",
+              ? `Discovered ${schemaPayload.databases.length} ${schemaPayload.contextLabel.toLowerCase()}(s) on ${connection.host}.`
+              : `Connected, but no ${schemaPayload.contextLabel.toLowerCase()}s were discovered.`,
         };
       });
       await loadAiModels(connectionId);
@@ -256,6 +308,7 @@ export function App() {
         ...workspace,
         schema: null,
         databases: [],
+        contextLabel: getContextLabel(connection.type),
         selectedDatabase: null,
         connectionStatus: "error",
         connectionMessage: error instanceof Error ? error.message : "Connection failed",
@@ -267,14 +320,25 @@ export function App() {
     updateWorkspace(connectionId, (workspace) => ({
       ...workspace,
       aiStatus: "loading",
-      aiMessage: "Loading Ollama models...",
+      aiMessage: workspace.aiBaseUrl
+        ? `Loading Ollama models from ${formatOllamaHostLabel(workspace.aiBaseUrl)}...`
+        : "Loading Ollama models...",
     }));
 
     try {
       const response = await fetch("/api/ai/models");
-      const payload = await response.json();
+      const payload = await readApiPayload(response);
+      const aiBaseUrl = getAiBaseUrl(payload);
       if (!response.ok) {
-        throw new Error(formatApiError(payload, "Failed to load Ollama models"));
+        updateWorkspace(connectionId, (workspace) => ({
+          ...workspace,
+          aiBaseUrl: aiBaseUrl ?? workspace.aiBaseUrl,
+          aiModels: [],
+          aiSelectedModel: null,
+          aiStatus: "error",
+          aiMessage: formatApiError(payload, "Failed to load Ollama models"),
+        }));
+        return;
       }
 
       const models = Array.isArray(payload.models)
@@ -288,6 +352,7 @@ export function App() {
           workspace.aiSelectedModel && models.includes(workspace.aiSelectedModel)
             ? workspace.aiSelectedModel
             : (models[0] ?? null),
+        aiBaseUrl,
         aiStatus: "ready",
         aiMessage:
           models.length > 0
@@ -297,6 +362,7 @@ export function App() {
     } catch (error) {
       updateWorkspace(connectionId, (workspace) => ({
         ...workspace,
+        aiBaseUrl: workspace.aiBaseUrl,
         aiModels: [],
         aiSelectedModel: null,
         aiStatus: "error",
@@ -340,14 +406,20 @@ export function App() {
       const databases = Array.isArray(payload.databases)
         ? payload.databases.filter((item: unknown): item is string => typeof item === "string")
         : [];
+      const contextLabel =
+        typeof payload.contextLabel === "string" && payload.contextLabel.trim() ? payload.contextLabel : "Database";
       const serverVersion =
         typeof payload.serverVersion === "string" && payload.serverVersion.length > 0
           ? payload.serverVersion
           : "unknown";
+      const dialectLabel =
+        typeof payload.dialectLabel === "string" && payload.dialectLabel.length > 0
+          ? payload.dialectLabel
+          : getDatabaseTypeLabel(draft.type);
 
       setDraftTestState({
         status: "success",
-        message: `Connected to server ${draft.host}:${draft.port}. MariaDB/MySQL ${serverVersion}. Accessible databases: ${databases.length}.`,
+        message: `Connected to ${dialectLabel} at ${draft.host}:${draft.port}. Version: ${serverVersion}. Accessible ${contextLabel.toLowerCase()}s: ${databases.length}.`,
       });
     } catch (error) {
       setDraftTestState({
@@ -411,7 +483,7 @@ export function App() {
     }
   }
 
-  async function runAiAction(connectionId: string, action: "generate" | "optimize") {
+  async function runAiAction(connectionId: string) {
     const connection = connections.find((item) => item.id === connectionId);
     const workspace = workspaces[connectionId] ?? createWorkspaceState();
     const tab = getActiveTab(workspace);
@@ -424,12 +496,12 @@ export function App() {
     updateWorkspace(connectionId, (current) => ({
       ...current,
       aiStatus: "loading",
-      aiMessage: action === "generate" ? "Generating SQL with Ollama..." : "Optimizing SQL with Ollama...",
+      aiMessage: "Generating SQL with Ollama...",
       aiNotes: "",
     }));
 
     try {
-      const response = await fetch(action === "generate" ? "/api/ai/generate-sql" : "/api/ai/optimize-sql", {
+      const response = await fetch("/api/ai/generate-sql", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -437,33 +509,43 @@ export function App() {
           selectedDatabase: workspace.selectedDatabase,
           schemaSummary: summarizeSchemaForAi(workspace.schema, workspace.selectedDatabase),
           prompt: workspace.aiPrompt,
-          sql: action === "optimize" ? cell.sql : undefined,
+          sql: cell.sql.trim() || undefined,
+          history: workspace.aiHistory.slice(-MAX_AI_HISTORY_ITEMS),
+          databaseType: connection.type,
         }),
       });
 
       const payload = await response.json();
       if (!response.ok) {
-        throw new Error(formatApiError(payload, `Failed to ${action === "generate" ? "generate" : "optimize"} SQL`));
+        throw new Error(formatApiError(payload, "Failed to generate SQL"));
       }
 
+      const nextSql = typeof payload.sql === "string" ? payload.sql : cell.sql;
+      const nextNotes = typeof payload.notes === "string" ? payload.notes : "";
+
       updateCell(connectionId, tab.id, cell.id, {
-        sql: typeof payload.sql === "string" ? payload.sql : cell.sql,
+        sql: nextSql,
       });
 
       updateWorkspace(connectionId, (current) => ({
         ...current,
         aiStatus: "ready",
-        aiMessage: action === "generate" ? "SQL generated by Ollama." : "SQL optimized by Ollama.",
-        aiNotes: typeof payload.notes === "string" ? payload.notes : "",
+        aiMessage: cell.sql.trim().length > 0 ? "SQL updated by Ollama." : "SQL generated by Ollama.",
+        aiNotes: nextNotes,
+        aiHistory: [
+          ...current.aiHistory,
+          {
+            prompt: workspace.aiPrompt,
+            sql: nextSql,
+            notes: nextNotes,
+          },
+        ].slice(-MAX_AI_HISTORY_ITEMS),
       }));
     } catch (error) {
       updateWorkspace(connectionId, (current) => ({
         ...current,
         aiStatus: "error",
-        aiMessage:
-          error instanceof Error
-            ? error.message
-            : `Failed to ${action === "generate" ? "generate" : "optimize"} SQL`,
+        aiMessage: error instanceof Error ? error.message : "Failed to generate SQL",
         aiNotes: "",
       }));
     }
@@ -546,11 +628,11 @@ export function App() {
 
   return (
     <div className="screen-shell">
-      <header className="topbar card">
+      <header className={`topbar topbar-shell ${page === "connections" ? "topbar-connections" : "topbar-workspace"} card`}>
         <div className="topbar-brand">
           <div className="topbar-title-row">
             <img className="brand-logo" src="/sql-ninja-logo.svg" alt="" />
-            <p className="eyebrow">SQL Ninja</p>
+            <p className="topbar-title">SQL Ninja</p>
           </div>
         </div>
 
@@ -559,7 +641,7 @@ export function App() {
             <div className="topbar-group">
               {activeWorkspace.databases.length > 0 ? (
                 <label className="topbar-inline-field" htmlFor="topbar-database-context">
-                  <span className="topbar-field-label">Database</span>
+                  <span className="topbar-field-label">{activeWorkspace.contextLabel}</span>
                   <select
                     id="topbar-database-context"
                     className="select-input topbar-select-input"
@@ -571,7 +653,7 @@ export function App() {
                       }))
                     }
                   >
-                    <option value="">No default database</option>
+                    <option value="">{`No default ${activeWorkspace.contextLabel.toLowerCase()}`}</option>
                     {activeWorkspace.databases.map((database) => (
                       <option key={database} value={database}>
                         {database}
@@ -614,16 +696,7 @@ export function App() {
 
       {page === "connections" ? (
         <div className="connections-layout">
-          <section className="card intro-card">
-            <p className="eyebrow">Connection Hub</p>
-            <h2>Connect to a MariaDB or MySQL server instance</h2>
-            <p className="muted">
-              Save server profiles, test them without choosing a specific database, and open a workspace that
-              discovers every accessible database on that instance.
-            </p>
-          </section>
-
-          <section className="card">
+          <section className="card connection-editor-card">
             <ConnectionManagerForm
               draft={draft}
               draftTestState={draftTestState}
@@ -730,7 +803,7 @@ export function App() {
               <div className="panel-header">
                 <div>
                   <p className="eyebrow">Schema</p>
-                  <h2>Instance tree</h2>
+                  <h2>Catalog tree</h2>
                 </div>
                 {activeConnection ? (
                   <button className="ghost-button" type="button" onClick={() => void discoverSchema(activeConnection.id)}>
@@ -760,7 +833,7 @@ export function App() {
                   ) : (
                     <div className="empty-state">
                       <p>No schema loaded yet.</p>
-                      <span>Select a connection and open its workspace to discover all databases.</span>
+                      <span>Select a connection and open its workspace to discover available databases or schemas.</span>
                     </div>
                   )}
                 </>
@@ -786,7 +859,6 @@ export function App() {
                 <AiAssistantPanel
                   connectionId={activeConnection.id}
                   workspace={activeWorkspace}
-                  hasNotebookSql={Boolean(activeNotebookCell?.sql.trim())}
                   onToggleCollapse={() =>
                     updateWorkspace(activeConnection.id, (workspace) => ({
                       ...workspace,
@@ -806,8 +878,7 @@ export function App() {
                     }))
                   }
                   onRefreshModels={() => void loadAiModels(activeConnection.id)}
-                  onGenerate={() => void runAiAction(activeConnection.id, "generate")}
-                  onOptimize={() => void runAiAction(activeConnection.id, "optimize")}
+                  onGenerate={() => void runAiAction(activeConnection.id)}
                 />
 
                 <section className="card notebook-shell">

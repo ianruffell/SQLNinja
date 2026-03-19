@@ -1,4 +1,11 @@
 import type { FormEvent } from "react";
+import {
+  DATABASE_TYPE_OPTIONS,
+  getConnectionTargetLabel,
+  getConnectionTargetPlaceholder,
+  getConnectionTypeDescription,
+  getDefaultPort,
+} from "../lib/schema";
 import type { ConnectionDraft, DraftTestState } from "../types";
 
 type ConnectionManagerFormProps = {
@@ -24,12 +31,23 @@ export function ConnectionManagerForm({
 }: ConnectionManagerFormProps) {
   return (
     <form className="connection-form" onSubmit={onSubmit}>
-      <div className="panel-header">
-        <div>
-          <p className="eyebrow">Editor</p>
-          <h2>{editing ? "Update server connection" : "Create server connection"}</h2>
-        </div>
-      </div>
+      <label>
+        Database engine
+        <select
+          value={draft.type}
+          onChange={(event) => {
+            const nextType = event.target.value as ConnectionDraft["type"];
+            const nextPort = draft.port === getDefaultPort(draft.type) ? getDefaultPort(nextType) : draft.port;
+            onChange({ ...draft, type: nextType, port: nextPort });
+          }}
+        >
+          {DATABASE_TYPE_OPTIONS.map((option) => (
+            <option key={option.value} value={option.value}>
+              {option.label}
+            </option>
+          ))}
+        </select>
+      </label>
 
       <label>
         Connection name
@@ -73,6 +91,15 @@ export function ConnectionManagerForm({
         />
       </label>
 
+      <label>
+        {getConnectionTargetLabel(draft.type)}
+        <input
+          value={draft.database}
+          onChange={(event) => onChange({ ...draft, database: event.target.value })}
+          placeholder={getConnectionTargetPlaceholder(draft.type)}
+        />
+      </label>
+
       <div className="form-actions">
         <button className="primary-button" type="submit">
           {editing ? "Save changes" : "Save connection"}
@@ -95,7 +122,7 @@ export function ConnectionManagerForm({
         ) : null}
       </div>
 
-      <p className="muted">Database selection happens in the workspace after the server connection succeeds.</p>
+      <p className="muted">{getConnectionTypeDescription(draft.type)}</p>
 
       {draftTestState.message ? (
         <p className={`test-message test-${draftTestState.status}`}>{draftTestState.message}</p>

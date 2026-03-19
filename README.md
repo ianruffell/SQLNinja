@@ -1,12 +1,12 @@
 # SQL Ninja
 
-SQL Ninja is a small web UI for MariaDB/MySQL schema exploration and notebook-style SQL execution.
+SQL Ninja is a small web UI for multi-database schema exploration and notebook-style SQL execution.
 
 ## Features
 
-- Create and manage multiple MariaDB or MySQL server connection profiles from a dedicated connections page.
-- Discover all accessible databases on a server, then inspect their tables, views, columns, and indexes from `INFORMATION_SCHEMA`.
-- Open a workspace per saved connection, browse the full instance tree, choose a database context for queries, and insert object names into the active SQL cell.
+- Create and manage saved connection profiles for MariaDB, MySQL, PostgreSQL, Oracle, SQL Server, and Apache Ignite from a dedicated connections page.
+- Discover the databases or schemas exposed by each engine, then inspect tables, views, columns, and indexes from the schema tree.
+- Open a workspace per saved connection, browse the full catalog tree, choose a database or schema context for queries, and insert object names into the active SQL cell.
 - Use a local Ollama server to generate SQL from natural language and optimize existing SQL queries.
 - Import JSON from public REST APIs into MariaDB/MySQL with a separate CLI application that flattens payload fields into table columns, including endpoints such as the Jolpica Ergast-compatible API.
 - Execute SQL in notebook-style cells and inspect result sets or command metadata.
@@ -16,7 +16,7 @@ SQL Ninja is a small web UI for MariaDB/MySQL schema exploration and notebook-st
 
 - React + Vite frontend
 - Express API
-- `mysql2/promise` for database access
+- `mysql2`, `pg`, `oracledb`, `mssql`, and `apache-ignite-client` for database access
 
 ## Getting started
 
@@ -36,11 +36,13 @@ SQL Ninja is a small web UI for MariaDB/MySQL schema exploration and notebook-st
 
 The frontend proxies API requests to the backend on port `8787`.
 
-To enable AI features, run a local Ollama server. By default the backend uses `http://127.0.0.1:11434`.
+To enable AI features, run an Ollama server. By default the backend uses `http://127.0.0.1:11434`.
+It first checks `OLLAMA_HOST`, then falls back to `OLLAMA_BASE_URL`.
+Values like `ollama.local:11434` are accepted and treated as `http://ollama.local:11434`.
 You can override that with:
 
 ```bash
-OLLAMA_BASE_URL=http://127.0.0.1:11434 npm run dev
+OLLAMA_HOST=ollama.local:11434 npm run dev
 ```
 
 For a production-style build:
@@ -102,10 +104,12 @@ Both POST endpoints accept:
 
 ```json
 {
+  "type": "mariadb",
   "host": "127.0.0.1",
   "port": 3306,
   "user": "root",
-  "password": "secret"
+  "password": "secret",
+  "database": "optional-initial-database-or-service"
 }
 ```
 
@@ -113,7 +117,8 @@ Both POST endpoints accept:
 
 ```json
 {
-  "database": "app_db",
+  "type": "postgres",
+  "selectedDatabase": "app_db",
   "sql": "SELECT * FROM users LIMIT 10;"
 }
 ```
