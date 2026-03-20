@@ -327,7 +327,7 @@ button {
 
 .app-shell {
   display: grid;
-  grid-template-columns: 330px minmax(0, 1fr);
+  grid-template-columns: 300px minmax(0, 1fr);
   gap: var(--layout-gap);
   align-items: start;
 }
@@ -646,7 +646,6 @@ select:focus {
 }
 
 .schema-card,
-.switcher-card,
 .ai-card {
   display: flex;
   flex-direction: column;
@@ -691,38 +690,6 @@ select:focus {
   flex-wrap: wrap;
   gap: 8px;
   align-items: center;
-}
-
-.switcher-list {
-  display: grid;
-  gap: 8px;
-}
-
-.switcher-summary {
-  margin-top: 4px;
-}
-
-.switcher-item {
-  display: grid;
-  gap: 4px;
-  width: 100%;
-  text-align: left;
-  padding: 11px 12px;
-  border-radius: 14px;
-  background: var(--tile-soft-bg);
-  border: 1px solid transparent;
-  color: var(--text);
-  transition:
-    background 160ms ease,
-    border-color 160ms ease,
-    transform 160ms ease;
-}
-
-.switcher-item:hover,
-.switcher-item.active {
-  border-color: rgba(141, 216, 255, 0.22);
-  background: rgba(141, 216, 255, 0.08);
-  transform: translateY(-1px);
 }
 
 .tree-group,

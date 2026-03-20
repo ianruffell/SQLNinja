@@ -710,50 +710,40 @@ export function App() {
         <div className="topbar-actions">
           {page === "workspace" && activeConnection && activeWorkspace ? (
             <div className="topbar-group">
-              {activeWorkspace.databases.length > 0 ? (
-                <label className="topbar-inline-field" htmlFor="topbar-database-context">
-                  <span className="topbar-field-label">{activeWorkspace.contextLabel}</span>
+              {connections.length > 0 ? (
+                <label className="topbar-inline-field" htmlFor="topbar-connection-switcher">
+                  <span className="topbar-field-label">Connection</span>
                   <select
-                    id="topbar-database-context"
+                    id="topbar-connection-switcher"
                     className="select-input topbar-select-input"
-                    value={activeWorkspace.selectedDatabase ?? ""}
-                    onChange={(event) =>
-                      updateWorkspace(activeConnection.id, (workspace) => ({
-                        ...workspace,
-                        selectedDatabase: event.target.value || null,
-                      }))
-                    }
+                    value={activeConnection.id}
+                    onChange={(event) => void openConnectionWorkspace(event.target.value)}
                   >
-                    <option value="">{`No default ${activeWorkspace.contextLabel.toLowerCase()}`}</option>
-                    {activeWorkspace.databases.map((database) => (
-                      <option key={database} value={database}>
-                        {database}
+                    {connections.map((connection) => (
+                      <option key={connection.id} value={connection.id}>
+                        {connection.name}
                       </option>
                     ))}
                   </select>
                 </label>
               ) : null}
-
-              <button className="ghost-button" type="button" onClick={() => addTab(activeConnection.id)}>
-                Add tab
-              </button>
             </div>
           ) : null}
 
           <div className="topbar-group">
-            <button
-              className="ghost-button"
-              type="button"
-              onClick={() => setTheme((current) => (current === "dark" ? "light" : "dark"))}
-            >
-              {theme === "dark" ? "Light theme" : "Dark theme"}
-            </button>
             <button
               className={`ghost-button ${page === "connections" ? "button-selected" : ""}`}
               type="button"
               onClick={() => setPage("connections")}
             >
               Connections
+            </button>
+            <button
+              className="ghost-button"
+              type="button"
+              onClick={() => setTheme((current) => (current === "dark" ? "light" : "dark"))}
+            >
+              {theme === "dark" ? "Light theme" : "Dark theme"}
             </button>
           </div>
 
@@ -844,32 +834,6 @@ export function App() {
       ) : (
         <div className="app-shell">
           <aside className="left-panel">
-            <section className="card switcher-card">
-              <div className="panel-header">
-                <div>
-                  <p className="eyebrow">Connections</p>
-                  <h2>Switch server</h2>
-                </div>
-                <button className="ghost-button" type="button" onClick={() => setPage("connections")}>
-                  Manage
-                </button>
-              </div>
-
-              <div className="switcher-list">
-                {connections.map((connection) => (
-                  <button
-                    key={connection.id}
-                    className={`switcher-item ${connection.id === activeConnectionId ? "active" : ""}`}
-                    type="button"
-                    onClick={() => void openConnectionWorkspace(connection.id)}
-                  >
-                    <strong>{connection.name}</strong>
-                    <span>{summarizeConnection(connection)}</span>
-                  </button>
-                ))}
-              </div>
-            </section>
-
             <section className="card schema-card">
               <div className="panel-header">
                 <div>
