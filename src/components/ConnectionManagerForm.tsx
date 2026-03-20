@@ -4,6 +4,7 @@ import {
   getConnectionTargetLabel,
   getConnectionTargetPlaceholder,
   getConnectionTypeDescription,
+  getDefaultConnectionName,
   getDefaultPort,
 } from "../lib/schema";
 import type { ConnectionDraft, DraftTestState } from "../types";
@@ -38,7 +39,11 @@ export function ConnectionManagerForm({
           onChange={(event) => {
             const nextType = event.target.value as ConnectionDraft["type"];
             const nextPort = draft.port === getDefaultPort(draft.type) ? getDefaultPort(nextType) : draft.port;
-            onChange({ ...draft, type: nextType, port: nextPort });
+            const nextName =
+              draft.name.trim().length === 0 || draft.name === getDefaultConnectionName(draft.type)
+                ? getDefaultConnectionName(nextType)
+                : draft.name;
+            onChange({ ...draft, type: nextType, port: nextPort, name: nextName });
           }}
         >
           {DATABASE_TYPE_OPTIONS.map((option) => (

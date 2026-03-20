@@ -1,6 +1,12 @@
+import { execFile, spawn } from "node:child_process";
+import type { ChildProcessWithoutNullStreams } from "node:child_process";
+import { mkdir, readdir, stat, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { promisify } from "node:util";
 import { RowDataPacket, createPool } from "mysql2/promise";
 
-export type DatabaseType = "mysql" | "mariadb" | "postgres" | "oracle" | "sqlserver" | "ignite";
+export type DatabaseType = "mysql" | "mariadb" | "postgres" | "oracle" | "sqlserver" | "ignite2" | "ignite3";
 
 export type ConnectionInput = {
   type: DatabaseType;
@@ -127,9 +133,85 @@ const ORACLE_SYSTEM_SCHEMAS = [
   "XS$NULL",
 ];
 const IGNITE_SYSTEM_SCHEMAS = ["INFORMATION_SCHEMA", "SYS"];
+const execFileAsync = promisify(execFile);
+const IGNITE_JDBC_DRIVER_CLASS = "org.apache.ignite.jdbc.IgniteJdbcDriver";
+const IGNITE_JDBC_SUPPORT_DIR = join(tmpdir(), "sqlninja-ignite-jdbc");
+
+type IgniteJdbcProfile = {
+  key: string;
+  label: string;
+  version: string;
+  groupId: string;
+  artifactId: string;
+};
+
+type IgniteJdbcSchemaPayload = {
+  schemas: string[];
+  relations: RelationRecord[];
+  columns: ColumnRecord[];
+  indexes: IndexRecord[];
+  serverVersion: string;
+};
+
+type IgniteJdbcQueryPayload =
+  | {
+      kind: "result-set";
+      columns: string[];
+      rows: Record<string, unknown>[];
+      rowCount: number;
+    }
+  | {
+      kind: "command";
+      affectedRows: number;
+      insertId: number | null;
+      warningStatus: number;
+    };
+
+type IgniteJdbcBridgeRequestAction = "test" | "schema" | "query";
+
+type IgniteJdbcBridgeSession = {
+  buffer: string;
+  nextRequestId: number;
+  pending: Map<
+    number,
+    {
+      resolve: (value: unknown) => void;
+      reject: (error: Error) => void;
+    }
+  >;
+  process: ChildProcessWithoutNullStreams;
+};
+
+const IGNITE_JDBC_PROFILES: IgniteJdbcProfile[] = [
+  {
+    key: "gridgain9",
+    label: "GridGain 9 JDBC",
+    groupId: "org.gridgain",
+    artifactId: "ignite-jdbc",
+    version: "9.1.17",
+  },
+  {
+    key: "gridgain9-legacy",
+    label: "GridGain 9 legacy JDBC",
+    groupId: "org.gridgain",
+    artifactId: "ignite-jdbc",
+    version: "9.1.15",
+  },
+  {
+    key: "ignite3",
+    label: "Apache Ignite 3 JDBC",
+    groupId: "org.apache.ignite",
+    artifactId: "ignite-jdbc",
+    version: "3.1.0",
+  },
+];
+const igniteJdbcBridgeSessions = new Map<string, IgniteJdbcBridgeSession>();
+const igniteJdbcDependencyPromises = new Map<string, Promise<string>>();
+let igniteJdbcBridgeCompilePromise: Promise<string> | null = null;
+const igniteJdbcPreferredProfileKeys = new Map<string, string>();
 
 export function getContextLabel(type: DatabaseType) {
-  return type === "oracle" || type === "ignite" ? "Schema" : "Database";
+  return type === "oracle" || type === "ignite2" || type === "ignite3" ? "Schema" : "Database";
 }
 
 export function getDialectLabel(type: DatabaseType) {
@@ -144,8 +226,10 @@ export function getDialectLabel(type: DatabaseType) {
       return "Oracle";
     case "sqlserver":
       return "SQL Server";
-    case "ignite":
-      return "Apache Ignite";
+    case "ignite2":
+      return "Apache Ignite 2.x / GridGain 8.x";
+    case "ignite3":
+      return "Apache Ignite 3.x / GridGain 9.x";
   }
 }
 
@@ -162,7 +246,8 @@ function getQuoteStyle(type: DatabaseType): QuoteStyle {
       return "bracket";
     case "postgres":
     case "oracle":
-    case "ignite":
+    case "ignite2":
+    case "ignite3":
     default:
       return "double";
   }
@@ -1215,9 +1300,647 @@ async function executeOracleSql(input: ConnectionInput, sql: string): Promise<Qu
   }
 }
 
+const IGNITE_JDBC_BRIDGE_SOURCE = `
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
+import java.sql.Connection;
+import java.sql.DatabaseMetaData;
+import java.sql.DriverManager;
+import java.sql.ResultSet;
+import java.sql.ResultSetMetaData;
+import java.sql.Statement;
+import java.sql.Types;
+import java.time.temporal.TemporalAccessor;
+import java.util.ArrayList;
+import java.util.Base64;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+
+public class IgniteJdbcBridge {
+    private static final Map<String, Connection> CONNECTIONS = new ConcurrentHashMap<>();
+
+    public static void main(String[] args) throws Exception {
+        if (args.length > 0 && "serve".equals(args[0])) {
+            serve();
+            return;
+        }
+
+        if (args.length < 4) {
+            throw new IllegalArgumentException("Usage: <action> <jdbcUrl> <userBase64> <passwordBase64> [sqlBase64]");
+        }
+
+        String action = args[0];
+        String jdbcUrl = args[1];
+        String user = decode(args[2]);
+        String password = decode(args[3]);
+        String sql = args.length > 4 ? decode(args[4]) : "";
+
+        Class.forName("${IGNITE_JDBC_DRIVER_CLASS}");
+
+        java.util.Properties properties = new java.util.Properties();
+        if (!user.isBlank()) {
+            properties.setProperty("user", user);
+            properties.setProperty("username", user);
+            properties.setProperty("password", password);
+        }
+
+        try (Connection connection = openConnection(jdbcUrl, user, password)) {
+            switch (action) {
+                case "test" -> printJson(runTest(connection));
+                case "schema" -> printJson(runSchema(connection));
+                case "query" -> printJson(runQuery(connection, sql));
+                default -> throw new IllegalArgumentException("Unsupported action: " + action);
+            }
+        }
+    }
+
+    private static void serve() throws Exception {
+        Class.forName("${IGNITE_JDBC_DRIVER_CLASS}");
+
+        BufferedReader reader = new BufferedReader(new InputStreamReader(System.in, java.nio.charset.StandardCharsets.UTF_8));
+        String line;
+        while ((line = reader.readLine()) != null) {
+            if (line.isBlank()) {
+                continue;
+            }
+
+            String[] parts = line.split("\\\\t", 6);
+            if (parts.length < 5) {
+                System.out.println("{\\"id\\":0,\\"ok\\":false,\\"error\\":\\"Invalid bridge request.\\"}");
+                System.out.flush();
+                continue;
+            }
+
+            int requestId = Integer.parseInt(parts[0]);
+            String action = parts[1];
+            String jdbcUrl = decode(parts[2]);
+            String user = decode(parts[3]);
+            String password = decode(parts[4]);
+            String sql = parts.length > 5 ? decode(parts[5]) : "";
+
+            try {
+                Connection connection = getOrCreateConnection(jdbcUrl, user, password);
+                Object result = switch (action) {
+                    case "test" -> runTest(connection);
+                    case "schema" -> runSchema(connection);
+                    case "query" -> runQuery(connection, sql);
+                    default -> throw new IllegalArgumentException("Unsupported action: " + action);
+                };
+                System.out.println("{\\"id\\":" + requestId + ",\\"ok\\":true,\\"result\\":" + toJson(result) + "}");
+            } catch (Exception error) {
+                invalidateConnection(jdbcUrl, user, password);
+                System.out.println(
+                    "{\\"id\\":" + requestId + ",\\"ok\\":false,\\"error\\":" + quote(error.getMessage() == null ? "Unknown error" : error.getMessage()) + "}"
+                );
+            }
+            System.out.flush();
+        }
+    }
+
+    private static Connection getOrCreateConnection(String jdbcUrl, String user, String password) throws Exception {
+        String key = jdbcUrl + "|" + user + "|" + password;
+        Connection existing = CONNECTIONS.get(key);
+        if (existing != null) {
+            try {
+                if (!existing.isClosed() && existing.isValid(2)) {
+                    return existing;
+                }
+            } catch (Exception ignored) {
+            }
+            invalidateConnection(jdbcUrl, user, password);
+        }
+
+        Connection connection = openConnection(jdbcUrl, user, password);
+        CONNECTIONS.put(key, connection);
+        return connection;
+    }
+
+    private static void invalidateConnection(String jdbcUrl, String user, String password) {
+        String key = jdbcUrl + "|" + user + "|" + password;
+        Connection existing = CONNECTIONS.remove(key);
+        if (existing == null) {
+            return;
+        }
+
+        try {
+            existing.close();
+        } catch (Exception ignored) {
+        }
+    }
+
+    private static Connection openConnection(String jdbcUrl, String user, String password) throws Exception {
+        java.util.Properties properties = new java.util.Properties();
+        if (!user.isBlank()) {
+            properties.setProperty("user", user);
+            properties.setProperty("username", user);
+            properties.setProperty("password", password);
+        }
+        return DriverManager.getConnection(jdbcUrl, properties);
+    }
+
+    private static Map<String, Object> runTest(Connection connection) throws Exception {
+        Map<String, Object> payload = new LinkedHashMap<>();
+        payload.put("serverVersion", connection.getMetaData().getDatabaseProductVersion());
+        payload.put("schemas", listSchemas(connection));
+        return payload;
+    }
+
+    private static Map<String, Object> runSchema(Connection connection) throws Exception {
+        DatabaseMetaData metaData = connection.getMetaData();
+        List<String> schemas = listSchemas(connection);
+        List<Map<String, Object>> relations = new ArrayList<>();
+        List<Map<String, Object>> columns = new ArrayList<>();
+        List<Map<String, Object>> indexes = new ArrayList<>();
+
+        for (String schemaName : schemas) {
+            try (ResultSet tables = metaData.getTables(null, schemaName, "%", new String[] { "TABLE", "VIEW" })) {
+                while (tables.next()) {
+                    String tableName = tables.getString("TABLE_NAME");
+                    String rawType = tables.getString("TABLE_TYPE");
+                    String tableType = "VIEW".equalsIgnoreCase(rawType) ? "VIEW" : "BASE TABLE";
+                    String remarks = tables.getString("REMARKS");
+
+                    Map<String, Object> relation = new LinkedHashMap<>();
+                    relation.put("contextName", schemaName);
+                    relation.put("schemaName", schemaName);
+                    relation.put("tableName", tableName);
+                    relation.put("tableType", tableType);
+                    relation.put("description", remarks);
+                    relations.add(relation);
+
+                    try (ResultSet columnSet = metaData.getColumns(null, schemaName, tableName, "%")) {
+                        while (columnSet.next()) {
+                            Map<String, Object> column = new LinkedHashMap<>();
+                            column.put("contextName", schemaName);
+                            column.put("schemaName", schemaName);
+                            column.put("tableName", tableName);
+                            column.put("columnName", columnSet.getString("COLUMN_NAME"));
+                            column.put("dataType", columnSet.getString("TYPE_NAME"));
+                            column.put("isNullable", columnSet.getInt("NULLABLE") == DatabaseMetaData.columnNoNulls ? "NO" : "YES");
+                            column.put("columnDefault", columnSet.getString("COLUMN_DEF"));
+                            column.put("extra", null);
+                            column.put("columnKey", null);
+                            columns.add(column);
+                        }
+                    }
+
+                    try (ResultSet indexSet = metaData.getIndexInfo(null, schemaName, tableName, false, false)) {
+                        while (indexSet.next()) {
+                            String indexName = indexSet.getString("INDEX_NAME");
+                            if (indexName == null || indexName.isBlank()) {
+                                continue;
+                            }
+
+                            Map<String, Object> index = new LinkedHashMap<>();
+                            index.put("contextName", schemaName);
+                            index.put("schemaName", schemaName);
+                            index.put("tableName", tableName);
+                            index.put("indexName", indexName);
+                            index.put("columnList", indexSet.getString("COLUMN_NAME"));
+                            index.put("definition", null);
+                            index.put("isUnique", !indexSet.getBoolean("NON_UNIQUE"));
+                            indexes.add(index);
+                        }
+                    } catch (Exception ignored) {
+                    }
+                }
+            }
+        }
+
+        Map<String, Object> payload = new LinkedHashMap<>();
+        payload.put("schemas", schemas);
+        payload.put("relations", relations);
+        payload.put("columns", columns);
+        payload.put("indexes", indexes);
+        payload.put("serverVersion", metaData.getDatabaseProductVersion());
+        return payload;
+    }
+
+    private static Map<String, Object> runQuery(Connection connection, String sql) throws Exception {
+        try (Statement statement = connection.createStatement()) {
+            boolean hasResultSet = statement.execute(sql);
+            if (hasResultSet) {
+                try (ResultSet resultSet = statement.getResultSet()) {
+                    ResultSetMetaData metaData = resultSet.getMetaData();
+                    List<String> columns = new ArrayList<>();
+                    for (int index = 1; index <= metaData.getColumnCount(); index++) {
+                        columns.add(metaData.getColumnLabel(index));
+                    }
+
+                    List<Map<String, Object>> rows = new ArrayList<>();
+                    while (resultSet.next()) {
+                        Map<String, Object> row = new LinkedHashMap<>();
+                        for (int index = 1; index <= columns.size(); index++) {
+                            row.put(columns.get(index - 1), normalizeValue(resultSet.getObject(index), metaData.getColumnType(index)));
+                        }
+                        rows.add(row);
+                    }
+
+                    Map<String, Object> payload = new LinkedHashMap<>();
+                    payload.put("kind", "result-set");
+                    payload.put("columns", columns);
+                    payload.put("rows", rows);
+                    payload.put("rowCount", rows.size());
+                    return payload;
+                }
+            }
+
+            Map<String, Object> payload = new LinkedHashMap<>();
+            payload.put("kind", "command");
+            payload.put("affectedRows", statement.getUpdateCount());
+            payload.put("insertId", null);
+            payload.put("warningStatus", 0);
+            return payload;
+        }
+    }
+
+    private static List<String> listSchemas(Connection connection) throws Exception {
+        List<String> schemas = new ArrayList<>();
+        try (ResultSet resultSet = connection.getMetaData().getSchemas()) {
+            while (resultSet.next()) {
+                String schemaName = resultSet.getString("TABLE_SCHEM");
+                if (schemaName == null) {
+                    continue;
+                }
+
+                String normalized = schemaName.toUpperCase(Locale.ROOT);
+                if (normalized.equals("INFORMATION_SCHEMA") || normalized.equals("SYS") || normalized.equals("SYSTEM")) {
+                    continue;
+                }
+                schemas.add(schemaName);
+            }
+        }
+        schemas.sort(String::compareToIgnoreCase);
+        return schemas;
+    }
+
+    private static Object normalizeValue(Object value, int sqlType) {
+        if (value == null) {
+            return null;
+        }
+        if (value instanceof String || value instanceof Number || value instanceof Boolean) {
+            return value;
+        }
+        if (value instanceof java.sql.Array arrayValue) {
+            try {
+                Object array = arrayValue.getArray();
+                if (array instanceof Object[] objects) {
+                    List<Object> values = new ArrayList<>();
+                    for (Object item : objects) {
+                        values.add(normalizeValue(item, Types.JAVA_OBJECT));
+                    }
+                    return values;
+                }
+            } catch (Exception ignored) {
+            }
+        }
+        if (value instanceof java.sql.Clob clobValue) {
+            try {
+                return clobValue.getSubString(1, (int) clobValue.length());
+            } catch (Exception ignored) {
+                return value.toString();
+            }
+        }
+        if (value instanceof byte[] bytes) {
+            return Base64.getEncoder().encodeToString(bytes);
+        }
+        if (value instanceof java.util.Date || value instanceof TemporalAccessor) {
+            return value.toString();
+        }
+        return value.toString();
+    }
+
+    private static String decode(String value) {
+        return new String(Base64.getDecoder().decode(value), java.nio.charset.StandardCharsets.UTF_8);
+    }
+
+    private static void printJson(Object value) {
+        System.out.println(toJson(value));
+    }
+
+    private static String toJson(Object value) {
+        if (value == null) {
+            return "null";
+        }
+        if (value instanceof String stringValue) {
+            return quote(stringValue);
+        }
+        if (value instanceof Number || value instanceof Boolean) {
+            return String.valueOf(value);
+        }
+        if (value instanceof Map<?, ?> mapValue) {
+            List<String> parts = new ArrayList<>();
+            for (Map.Entry<?, ?> entry : mapValue.entrySet()) {
+                parts.add(quote(String.valueOf(entry.getKey())) + ":" + toJson(entry.getValue()));
+            }
+            return "{" + String.join(",", parts) + "}";
+        }
+        if (value instanceof Iterable<?> iterableValue) {
+            List<String> parts = new ArrayList<>();
+            for (Object item : iterableValue) {
+                parts.add(toJson(item));
+            }
+            return "[" + String.join(",", parts) + "]";
+        }
+        return quote(String.valueOf(value));
+    }
+
+    private static String quote(String value) {
+        StringBuilder builder = new StringBuilder();
+        builder.append('"');
+        for (int index = 0; index < value.length(); index++) {
+            char ch = value.charAt(index);
+            switch (ch) {
+                case '\\\\' -> builder.append((char) 92).append((char) 92);
+                case '"' -> builder.append((char) 92).append((char) 34);
+                case '\\b' -> builder.append("\\\\b");
+                case '\\f' -> builder.append("\\\\f");
+                case '\\n' -> builder.append("\\\\n");
+                case '\\r' -> builder.append("\\\\r");
+                case '\\t' -> builder.append("\\\\t");
+                default -> {
+                    if (ch < 0x20) {
+                        builder.append(String.format("\\\\u%04x", (int) ch));
+                    } else {
+                        builder.append(ch);
+                    }
+                }
+            }
+        }
+        builder.append('"');
+        return builder.toString();
+    }
+}
+`;
+
 async function loadIgniteModule() {
   const module = (await import("apache-ignite-client")) as { default?: any };
   return (module.default ?? module) as any;
+}
+
+function encodeBridgeArg(value: string | undefined) {
+  return Buffer.from(value ?? "", "utf8").toString("base64");
+}
+
+function buildIgniteJdbcUrl(input: ConnectionInput) {
+  const schema = input.selectedDatabase ?? input.database;
+  return `jdbc:ignite:thin://${input.host}:${input.port}${schema ? `/${encodeURIComponent(schema)}` : ""}`;
+}
+
+function getIgniteJdbcProfileCacheKey(input: ConnectionInput) {
+  return `${input.host}:${input.port}:${input.user.trim()}`;
+}
+
+function createIgniteJdbcPom(profile: IgniteJdbcProfile) {
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>local.sqlninja</groupId>
+  <artifactId>${profile.key}</artifactId>
+  <version>1.0.0</version>
+  <dependencies>
+    <dependency>
+      <groupId>${profile.groupId}</groupId>
+      <artifactId>${profile.artifactId}</artifactId>
+      <version>${profile.version}</version>
+    </dependency>
+  </dependencies>
+</project>
+`;
+}
+
+async function ensureIgniteJdbcBridgeCompiled(baseDir: string) {
+  if (igniteJdbcBridgeCompilePromise) {
+    return igniteJdbcBridgeCompilePromise;
+  }
+
+  const sourcePath = join(baseDir, "IgniteJdbcBridge.java");
+  const classPath = join(baseDir, "IgniteJdbcBridge.class");
+  igniteJdbcBridgeCompilePromise = (async () => {
+    await mkdir(baseDir, { recursive: true });
+    await writeFile(sourcePath, IGNITE_JDBC_BRIDGE_SOURCE, "utf8");
+
+    let shouldCompile = true;
+    try {
+      const [sourceStats, classStats] = await Promise.all([stat(sourcePath), stat(classPath)]);
+      shouldCompile = classStats.mtimeMs < sourceStats.mtimeMs;
+    } catch {
+      shouldCompile = true;
+    }
+
+    if (shouldCompile) {
+      await execFileAsync("javac", ["-d", baseDir, sourcePath], {
+        maxBuffer: 1024 * 1024 * 8,
+      });
+    }
+
+    return classPath;
+  })().catch((error) => {
+    igniteJdbcBridgeCompilePromise = null;
+    throw error;
+  });
+
+  return igniteJdbcBridgeCompilePromise;
+}
+
+async function ensureIgniteJdbcDependencies(profile: IgniteJdbcProfile, baseDir: string) {
+  const existingPromise = igniteJdbcDependencyPromises.get(profile.key);
+  if (existingPromise) {
+    return existingPromise;
+  }
+
+  const pomPath = join(baseDir, "pom.xml");
+  const depsDir = join(baseDir, "deps");
+  const promise = (async () => {
+    await mkdir(depsDir, { recursive: true });
+    await writeFile(pomPath, createIgniteJdbcPom(profile), "utf8");
+
+    const existingFiles = await readdir(depsDir).catch(() => []);
+    if (!existingFiles.some((file) => file.endsWith(".jar"))) {
+      await execFileAsync(
+        "mvn",
+        ["-q", "dependency:copy-dependencies", `-DoutputDirectory=${depsDir}`, "-DincludeScope=runtime"],
+        {
+          cwd: baseDir,
+          maxBuffer: 1024 * 1024 * 8,
+        },
+      );
+    }
+
+    return depsDir;
+  })().catch((error) => {
+    igniteJdbcDependencyPromises.delete(profile.key);
+    throw error;
+  });
+
+  igniteJdbcDependencyPromises.set(profile.key, promise);
+  return promise;
+}
+
+async function createIgniteJdbcBridgeSession(profile: IgniteJdbcProfile): Promise<IgniteJdbcBridgeSession> {
+  const profileDir = join(IGNITE_JDBC_SUPPORT_DIR, profile.key);
+  const bridgeDir = join(IGNITE_JDBC_SUPPORT_DIR, "bridge");
+
+  await mkdir(profileDir, { recursive: true });
+  await ensureIgniteJdbcBridgeCompiled(bridgeDir);
+  const depsDir = await ensureIgniteJdbcDependencies(profile, profileDir);
+
+  const jarFiles = (await readdir(depsDir))
+    .filter((file) => file.endsWith(".jar"))
+    .map((file) => join(depsDir, file));
+
+  if (jarFiles.length === 0) {
+    throw new Error(`${profile.label} dependencies were not downloaded.`);
+  }
+
+  const classpath = [bridgeDir, ...jarFiles].join(process.platform === "win32" ? ";" : ":");
+  const child = spawn("java", ["-cp", classpath, "IgniteJdbcBridge", "serve"], {
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  const session: IgniteJdbcBridgeSession = {
+    process: child,
+    buffer: "",
+    nextRequestId: 1,
+    pending: new Map(),
+  };
+
+  child.stdout.setEncoding("utf8");
+  child.stdout.on("data", (chunk: string) => {
+    session.buffer += chunk;
+
+    while (true) {
+      const newlineIndex = session.buffer.indexOf("\n");
+      if (newlineIndex === -1) {
+        break;
+      }
+
+      const line = session.buffer.slice(0, newlineIndex).trim();
+      session.buffer = session.buffer.slice(newlineIndex + 1);
+      if (!line) {
+        continue;
+      }
+
+      try {
+        const payload = JSON.parse(line) as { id: number; ok: boolean; result?: unknown; error?: string };
+        const pending = session.pending.get(payload.id);
+        if (!pending) {
+          continue;
+        }
+        session.pending.delete(payload.id);
+
+        if (payload.ok) {
+          pending.resolve(payload.result);
+        } else {
+          pending.reject(new Error(payload.error || `${profile.label} bridge request failed.`));
+        }
+      } catch (error) {
+        const pendingEntries = [...session.pending.values()];
+        session.pending.clear();
+        for (const pending of pendingEntries) {
+          pending.reject(error instanceof Error ? error : new Error("Failed to parse JDBC bridge response."));
+        }
+      }
+    }
+  });
+
+  const rejectAll = (error: Error) => {
+    const pendingEntries = [...session.pending.values()];
+    session.pending.clear();
+    for (const pending of pendingEntries) {
+      pending.reject(error);
+    }
+  };
+
+  child.stderr.setEncoding("utf8");
+  let stderrOutput = "";
+  child.stderr.on("data", (chunk: string) => {
+    stderrOutput += chunk;
+  });
+
+  child.on("exit", (code) => {
+    igniteJdbcBridgeSessions.delete(profile.key);
+    const message = `${profile.label} bridge exited${code === null ? "" : ` with code ${code}`}${
+      stderrOutput.trim() ? `. ${stderrOutput.trim()}` : ""
+    }`;
+    rejectAll(new Error(message));
+  });
+
+  child.on("error", (error) => {
+    igniteJdbcBridgeSessions.delete(profile.key);
+    rejectAll(error instanceof Error ? error : new Error(`${profile.label} bridge failed to start.`));
+  });
+
+  return session;
+}
+
+async function ensureIgniteJdbcBridgeSession(profile: IgniteJdbcProfile) {
+  const existing = igniteJdbcBridgeSessions.get(profile.key);
+  if (existing) {
+    return existing;
+  }
+
+  const session = await createIgniteJdbcBridgeSession(profile);
+  igniteJdbcBridgeSessions.set(profile.key, session);
+  return session;
+}
+
+async function runIgniteJdbcBridge<T>(
+  profile: IgniteJdbcProfile,
+  action: IgniteJdbcBridgeRequestAction,
+  input: ConnectionInput,
+  sql?: string,
+) {
+  const session = await ensureIgniteJdbcBridgeSession(profile);
+  const requestId = session.nextRequestId++;
+  const requestLine = [
+    String(requestId),
+    action,
+    encodeBridgeArg(buildIgniteJdbcUrl(input)),
+    encodeBridgeArg(input.user.trim()),
+    encodeBridgeArg(input.password),
+    encodeBridgeArg(sql),
+  ].join("\t");
+
+  return await new Promise<T>((resolve, reject) => {
+    session.pending.set(requestId, { resolve: resolve as (value: unknown) => void, reject });
+    session.process.stdin.write(`${requestLine}\n`, "utf8", (error) => {
+      if (!error) {
+        return;
+      }
+      session.pending.delete(requestId);
+      reject(error);
+    });
+  });
+}
+
+async function runIgniteJdbcAcrossProfiles<T>(input: ConnectionInput, action: (profile: IgniteJdbcProfile) => Promise<T>) {
+  const cacheKey = getIgniteJdbcProfileCacheKey(input);
+  const preferredProfileKey = igniteJdbcPreferredProfileKeys.get(cacheKey);
+  const orderedProfiles = preferredProfileKey
+    ? [
+        ...IGNITE_JDBC_PROFILES.filter((profile) => profile.key === preferredProfileKey),
+        ...IGNITE_JDBC_PROFILES.filter((profile) => profile.key !== preferredProfileKey),
+      ]
+    : IGNITE_JDBC_PROFILES;
+  const jdbcErrors: string[] = [];
+
+  for (const profile of orderedProfiles) {
+    try {
+      const result = await action(profile);
+      igniteJdbcPreferredProfileKeys.set(cacheKey, profile.key);
+      return result;
+    } catch (error) {
+      jdbcErrors.push(`${profile.label}: ${error instanceof Error ? error.message : "Unknown error"}`);
+    }
+  }
+
+  throw new Error(`Ignite 3.x / GridGain 9.x JDBC connection failed. ${jdbcErrors.join(" | ")}`);
 }
 
 async function createIgniteClient(input: ConnectionInput) {
@@ -1269,7 +1992,7 @@ async function listIgniteSchemas(client: any, IgniteClient: any) {
     .filter((name) => name.length > 0);
 }
 
-async function discoverIgniteSchema(input: ConnectionInput): Promise<SchemaResponse> {
+async function discoverIgnite2Schema(input: ConnectionInput): Promise<SchemaResponse> {
   const { client, IgniteClient } = await createIgniteClient(input);
 
   try {
@@ -1349,13 +2072,43 @@ async function discoverIgniteSchema(input: ConnectionInput): Promise<SchemaRespo
       }, {}),
     );
 
-    return buildTree(input, schemas, relationRows as RelationRecord[], columnRows as ColumnRecord[], groupedIndexes, "schema");
+    return buildTree(
+      input,
+      schemas,
+      relationRows as RelationRecord[],
+      columnRows as ColumnRecord[],
+      groupedIndexes,
+      "schema",
+    );
   } finally {
     client.disconnect();
   }
 }
 
-async function testIgniteConnection(input: ConnectionInput): Promise<TestConnectionResponse> {
+async function discoverIgnite3Schema(input: ConnectionInput): Promise<SchemaResponse> {
+  return runIgniteJdbcAcrossProfiles(input, async (profile) => {
+    const payload = await runIgniteJdbcBridge<IgniteJdbcSchemaPayload>(profile, "schema", input);
+    const groupedIndexes = Object.values(
+      payload.indexes.reduce<Record<string, IndexRecord>>((accumulator, row) => {
+        const key = `${row.contextName}.${row.schemaName}.${row.tableName}.${row.indexName}`;
+        if (!accumulator[key]) {
+          accumulator[key] = {
+            ...row,
+            columnList: row.columnList ?? "",
+          };
+        } else if (row.columnList) {
+          const current = accumulator[key].columnList?.trim();
+          accumulator[key].columnList = current ? `${current}, ${row.columnList}` : row.columnList;
+        }
+        return accumulator;
+      }, {}),
+    );
+
+    return buildTree(input, payload.schemas, payload.relations, payload.columns, groupedIndexes, "schema");
+  });
+}
+
+async function testIgnite2Connection(input: ConnectionInput): Promise<TestConnectionResponse> {
   const { client, IgniteClient } = await createIgniteClient(input);
 
   try {
@@ -1372,6 +2125,19 @@ async function testIgniteConnection(input: ConnectionInput): Promise<TestConnect
   } finally {
     client.disconnect();
   }
+}
+
+async function testIgnite3Connection(input: ConnectionInput): Promise<TestConnectionResponse> {
+  return runIgniteJdbcAcrossProfiles(input, async (profile) => {
+    const payload = await runIgniteJdbcBridge<{ serverVersion: string; schemas: string[] }>(profile, "test", input);
+    return {
+      currentContext: input.database ?? payload.schemas[0] ?? null,
+      serverVersion: payload.serverVersion || `${profile.label} connected`,
+      databases: payload.schemas,
+      contextLabel: getContextLabel(input.type),
+      dialectLabel: getDialectLabel(input.type),
+    };
+  });
 }
 
 function normalizeIgniteResult(result: { rows: unknown[][]; fieldNames: string[] }): QueryStatementResult {
@@ -1392,7 +2158,7 @@ function normalizeIgniteResult(result: { rows: unknown[][]; fieldNames: string[]
   };
 }
 
-async function executeIgniteSql(input: ConnectionInput, sql: string): Promise<QueryStatementResult[]> {
+async function executeIgnite2Sql(input: ConnectionInput, sql: string): Promise<QueryStatementResult[]> {
   const { client, IgniteClient } = await createIgniteClient(input);
 
   try {
@@ -1411,6 +2177,24 @@ async function executeIgniteSql(input: ConnectionInput, sql: string): Promise<Qu
   }
 }
 
+async function executeIgnite3Sql(input: ConnectionInput, sql: string): Promise<QueryStatementResult[]> {
+  return runIgniteJdbcAcrossProfiles(input, async (profile) => {
+    const statements = splitSqlStatements(sql);
+    const results: QueryStatementResult[] = [];
+
+    for (const statement of statements) {
+      const result = await runIgniteJdbcBridge<IgniteJdbcQueryPayload>(profile, "query", input, statement);
+      if (result.kind === "result-set") {
+        results.push(normalizeRowsAsResultSet(result.rows, result.columns, result.rowCount));
+      } else {
+        results.push(normalizeCommandResult(result.affectedRows, result.insertId, result.warningStatus));
+      }
+    }
+
+    return results;
+  });
+}
+
 export async function discoverSchema(input: ConnectionInput): Promise<SchemaResponse> {
   switch (input.type) {
     case "mysql":
@@ -1422,8 +2206,10 @@ export async function discoverSchema(input: ConnectionInput): Promise<SchemaResp
       return discoverOracleSchema(input);
     case "sqlserver":
       return discoverSqlServerSchema(input);
-    case "ignite":
-      return discoverIgniteSchema(input);
+    case "ignite2":
+      return discoverIgnite2Schema(input);
+    case "ignite3":
+      return discoverIgnite3Schema(input);
   }
 }
 
@@ -1438,8 +2224,10 @@ export async function testConnection(input: ConnectionInput): Promise<TestConnec
       return testOracleConnection(input);
     case "sqlserver":
       return testSqlServerConnection(input);
-    case "ignite":
-      return testIgniteConnection(input);
+    case "ignite2":
+      return testIgnite2Connection(input);
+    case "ignite3":
+      return testIgnite3Connection(input);
   }
 }
 
@@ -1457,8 +2245,10 @@ export async function executeSql(input: ConnectionInput, sql: string): Promise<Q
         return executeOracleSql(input, sql);
       case "sqlserver":
         return executeSqlServerSql(input, sql);
-      case "ignite":
-        return executeIgniteSql(input, sql);
+      case "ignite2":
+        return executeIgnite2Sql(input, sql);
+      case "ignite3":
+        return executeIgnite3Sql(input, sql);
     }
   })();
 

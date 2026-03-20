@@ -13,7 +13,8 @@ const DEFAULT_PORTS: Record<DatabaseType, number> = {
   postgres: 5432,
   oracle: 1521,
   sqlserver: 1433,
-  ignite: 10800,
+  ignite2: 10800,
+  ignite3: 10800,
 };
 
 const DATABASE_TYPE_LABELS: Record<DatabaseType, string> = {
@@ -22,7 +23,8 @@ const DATABASE_TYPE_LABELS: Record<DatabaseType, string> = {
   postgres: "PostgreSQL",
   oracle: "Oracle",
   sqlserver: "SQL Server",
-  ignite: "Apache Ignite",
+  ignite2: "Apache Ignite 2.x / GridGain 8.x",
+  ignite3: "Apache Ignite 3.x / GridGain 9.x",
 };
 
 export const DATABASE_TYPE_OPTIONS = (Object.keys(DATABASE_TYPE_LABELS) as DatabaseType[]).map((type) => ({
@@ -37,8 +39,11 @@ function normalizeDatabaseType(value: unknown): DatabaseType {
     case "postgres":
     case "oracle":
     case "sqlserver":
-    case "ignite":
+    case "ignite2":
+    case "ignite3":
       return value;
+    case "ignite":
+      return "ignite2";
     default:
       return "mariadb";
   }
@@ -52,8 +57,28 @@ export function getDatabaseTypeLabel(type: DatabaseType) {
   return DATABASE_TYPE_LABELS[type];
 }
 
+export function getDefaultConnectionName(type: DatabaseType) {
+  return getDatabaseTypeLabel(type);
+}
+
 export function getContextLabel(type: DatabaseType) {
-  return type === "oracle" || type === "ignite" ? "Schema" : "Database";
+  return type === "oracle" || type === "ignite2" || type === "ignite3" ? "Schema" : "Database";
+}
+
+export function buildTablePreviewSql(type: DatabaseType, reference: string) {
+  switch (type) {
+    case "sqlserver":
+      return `SELECT TOP 100 * FROM ${reference};`;
+    case "oracle":
+    case "ignite2":
+    case "ignite3":
+      return `SELECT * FROM ${reference} FETCH FIRST 100 ROWS ONLY;`;
+    case "mysql":
+    case "mariadb":
+    case "postgres":
+    default:
+      return `SELECT * FROM ${reference} LIMIT 100;`;
+  }
 }
 
 export function getConnectionTargetLabel(type: DatabaseType) {
@@ -63,7 +88,8 @@ export function getConnectionTargetLabel(type: DatabaseType) {
     case "postgres":
     case "sqlserver":
       return "Initial database";
-    case "ignite":
+    case "ignite2":
+    case "ignite3":
       return "Default schema";
     case "mysql":
     case "mariadb":
@@ -80,7 +106,8 @@ export function getConnectionTargetPlaceholder(type: DatabaseType) {
       return "postgres";
     case "sqlserver":
       return "master";
-    case "ignite":
+    case "ignite2":
+    case "ignite3":
       return "PUBLIC";
     case "mysql":
     case "mariadb":
@@ -97,8 +124,10 @@ export function getConnectionTypeDescription(type: DatabaseType) {
       return "PostgreSQL can connect through an initial database such as postgres, then inspect accessible databases.";
     case "sqlserver":
       return "SQL Server typically connects through an initial database such as master, then discovers other databases.";
-    case "ignite":
-      return "Ignite connects over the thin client port and can use an optional default SQL schema.";
+    case "ignite2":
+      return "Ignite 2.x and GridGain 8.x connect over the thin client port and use SQL schemas such as PUBLIC.";
+    case "ignite3":
+      return "Ignite 3.x and GridGain 9.x connect over the client connector on port 10800 and use the JDBC driver path.";
     case "mysql":
     case "mariadb":
     default:

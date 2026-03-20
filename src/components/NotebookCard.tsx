@@ -68,10 +68,14 @@ export function NotebookCard({
   }
 
   return (
-    <article className={`card notebook-card ${active ? "active" : ""}`} onClick={onActivate}>
+    <article
+      className={`card notebook-card ${active ? "active" : ""} ${cell.status === "running" ? "running" : ""}`}
+      onClick={onActivate}
+    >
       <div className="panel-header">
         <div className="cell-actions">
           <span className={`status-pill status-${cell.status}`}>{cell.status}</span>
+          {cell.status === "running" ? <span className="notebook-running-indicator">Running query...</span> : null}
           <button
             className="ghost-button"
             type="button"

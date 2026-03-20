@@ -902,15 +902,63 @@ select:focus {
   border-radius: 0;
   box-shadow: none;
   background: var(--editor-panel-bg), var(--panel-strong);
+  overflow: hidden;
+}
+
+.notebook-card.running::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 3px;
+  background: linear-gradient(90deg, transparent 0%, var(--accent) 22%, var(--accent-strong) 50%, transparent 78%);
+  background-size: 220% 100%;
+  animation: notebook-running-bar 1.2s linear infinite;
+  z-index: 1;
+}
+
+.notebook-card.running::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background: radial-gradient(circle at top center, rgba(141, 216, 255, 0.12), transparent 52%);
+  animation: notebook-running-glow 1.8s ease-in-out infinite;
+  z-index: 0;
 }
 
 .notebook-card.active {
   border-color: transparent;
 }
 
+.notebook-card > * {
+  position: relative;
+  z-index: 1;
+}
+
 .editor-shell {
   display: grid;
   gap: 8px;
+}
+
+.notebook-running-indicator {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.76rem;
+  color: var(--accent);
+  letter-spacing: 0.02em;
+}
+
+.notebook-running-indicator::before {
+  content: "";
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  background: var(--accent);
+  box-shadow: 0 0 0 0 rgba(141, 216, 255, 0.35);
+  animation: notebook-running-dot 1.2s ease-out infinite;
 }
 
 .sql-editor {
@@ -1094,6 +1142,40 @@ select:focus {
   gap: 8px;
   border-top: 1px solid rgba(255, 255, 255, 0.08);
   padding-top: 10px;
+}
+
+@keyframes notebook-running-bar {
+  from {
+    background-position: 200% 0;
+  }
+  to {
+    background-position: -20% 0;
+  }
+}
+
+@keyframes notebook-running-glow {
+  0%,
+  100% {
+    opacity: 0.32;
+  }
+  50% {
+    opacity: 0.7;
+  }
+}
+
+@keyframes notebook-running-dot {
+  0% {
+    transform: scale(0.92);
+    box-shadow: 0 0 0 0 rgba(141, 216, 255, 0.3);
+  }
+  70% {
+    transform: scale(1.08);
+    box-shadow: 0 0 0 8px rgba(141, 216, 255, 0);
+  }
+  100% {
+    transform: scale(0.92);
+    box-shadow: 0 0 0 0 rgba(141, 216, 255, 0);
+  }
 }
 
 .statement-block {

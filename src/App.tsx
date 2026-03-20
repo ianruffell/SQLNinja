@@ -4,9 +4,11 @@ import { ConnectionManagerForm } from "./components/ConnectionManagerForm";
 import { NotebookCard } from "./components/NotebookCard";
 import { SchemaTree } from "./components/SchemaTree";
 import {
+  buildTablePreviewSql,
   formatApiError,
   getContextLabel,
   getDatabaseTypeLabel,
+  getDefaultConnectionName,
   normalizeSavedConnection,
   normalizeSchemaPayload,
   sanitizeDraft,
@@ -48,7 +50,7 @@ const initialConnection = {
 };
 
 const initialDraft: ConnectionDraft = {
-  name: "Local MariaDB",
+  name: getDefaultConnectionName(initialConnection.type),
   ...initialConnection,
 };
 
@@ -443,16 +445,14 @@ export function App() {
     }));
   }
 
-  async function runCell(connectionId: string, tabId: string, cellId: string) {
-    const connection = connections.find((item) => item.id === connectionId);
-    const workspace = workspaces[connectionId] ?? createWorkspaceState();
-    const tab = workspace.tabs.find((item) => item.id === tabId);
-    const cell = tab?.cells.find((item) => item.id === cellId);
-
-    if (!connection || !cell) {
-      return;
-    }
-
+  async function executeCellQuery(
+    connectionId: string,
+    connection: SavedConnection,
+    selectedDatabase: string | null,
+    tabId: string,
+    cellId: string,
+    sql: string,
+  ) {
     updateCell(connectionId, tabId, cellId, { status: "running", error: undefined });
 
     try {
@@ -460,8 +460,8 @@ export function App() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          ...toConnectionPayload(connection, workspace.selectedDatabase),
-          sql: cell.sql,
+          ...toConnectionPayload(connection, selectedDatabase),
+          sql,
         }),
       });
 
@@ -481,6 +481,19 @@ export function App() {
         error: error instanceof Error ? error.message : "Query failed",
       });
     }
+  }
+
+  async function runCell(connectionId: string, tabId: string, cellId: string) {
+    const connection = connections.find((item) => item.id === connectionId);
+    const workspace = workspaces[connectionId] ?? createWorkspaceState();
+    const tab = workspace.tabs.find((item) => item.id === tabId);
+    const cell = tab?.cells.find((item) => item.id === cellId);
+
+    if (!connection || !cell) {
+      return;
+    }
+
+    await executeCellQuery(connectionId, connection, workspace.selectedDatabase, tabId, cellId, cell.sql);
   }
 
   async function runAiAction(connectionId: string) {
@@ -596,6 +609,64 @@ export function App() {
     updateCell(activeConnectionId, activeTab.id, activeTab.activeCellId, {
       sql: `${currentCell.sql}${spacer}${node.reference ?? `\`${node.label}\``}`,
     });
+  }
+
+  function openTablePreview(connectionId: string, node: SchemaNode) {
+    if (node.type !== "table" || !node.reference) {
+      return;
+    }
+
+    const connection = connections.find((item) => item.id === connectionId);
+    const workspace = workspaces[connectionId] ?? createWorkspaceState();
+    if (!connection) {
+      return;
+    }
+
+    const previewSql = buildTablePreviewSql(connection.type, node.reference);
+    const existingTab = workspace.tabs.find((tab) => {
+      const firstCell = tab.cells[0];
+      return firstCell?.sql.trim() === previewSql;
+    });
+
+    if (existingTab) {
+      const previewCell = existingTab.cells[0];
+      if (!previewCell) {
+        return;
+      }
+
+      updateWorkspace(connectionId, (current) => ({
+        ...current,
+        activeTabId: existingTab.id,
+      }));
+      void executeCellQuery(connectionId, connection, workspace.selectedDatabase, existingTab.id, previewCell.id, previewSql);
+      return;
+    }
+
+    const nextTab = createTab(workspace.tabs.length + 1);
+    const previewCell = {
+      ...nextTab.cells[0],
+      title: node.label,
+      sql: previewSql,
+      status: "running" as const,
+      result: undefined,
+      error: undefined,
+    };
+    const previewTab = {
+      ...nextTab,
+      title: `Preview ${node.label}`,
+      cells: [previewCell],
+      activeCellId: previewCell.id,
+    };
+
+    updateWorkspace(connectionId, (current) => ({
+      ...current,
+      tabs: [...current.tabs, previewTab],
+      activeTabId: previewTab.id,
+    }));
+
+    window.setTimeout(() => {
+      void executeCellQuery(connectionId, connection, workspace.selectedDatabase, previewTab.id, previewCell.id, previewSql);
+    }, 0);
   }
 
   function editConnection(connection: SavedConnection) {
@@ -821,6 +892,11 @@ export function App() {
                       depth={0}
                       selectedDatabase={activeWorkspace.selectedDatabase}
                       onInsertReference={insertReference}
+                      onOpenTablePreview={(node) => {
+                        if (activeConnectionId) {
+                          openTablePreview(activeConnectionId, node);
+                        }
+                      }}
                       onSelectDatabase={(database) =>
                         activeConnectionId
                           ? updateWorkspace(activeConnectionId, (workspace) => ({
@@ -875,6 +951,16 @@ export function App() {
                     updateWorkspace(activeConnection.id, (workspace) => ({
                       ...workspace,
                       aiPrompt: prompt,
+                    }))
+                  }
+                  onClearContext={() =>
+                    updateWorkspace(activeConnection.id, (workspace) => ({
+                      ...workspace,
+                      aiPrompt: "",
+                      aiNotes: "",
+                      aiHistory: [],
+                      aiStatus: "idle",
+                      aiMessage: "AI context cleared. Current SQL remains in the notebook.",
                     }))
                   }
                   onRefreshModels={() => void loadAiModels(activeConnection.id)}

@@ -1,4 +1,4 @@
-export type DatabaseType = "mysql" | "mariadb" | "postgres" | "oracle" | "sqlserver" | "ignite";
+export type DatabaseType = "mysql" | "mariadb" | "postgres" | "oracle" | "sqlserver" | "ignite2" | "ignite3";
 
 export type ConnectionConfig = {
   type: DatabaseType;

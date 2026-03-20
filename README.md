@@ -4,10 +4,11 @@ SQL Ninja is a small web UI for multi-database schema exploration and notebook-s
 
 ## Features
 
-- Create and manage saved connection profiles for MariaDB, MySQL, PostgreSQL, Oracle, SQL Server, and Apache Ignite from a dedicated connections page.
+- Create and manage saved connection profiles for MariaDB, MySQL, PostgreSQL, Oracle, SQL Server, Apache Ignite 2.x / GridGain 8.x, and Apache Ignite 3.x / GridGain 9.x from a dedicated connections page.
 - Discover the databases or schemas exposed by each engine, then inspect tables, views, columns, and indexes from the schema tree.
 - Open a workspace per saved connection, browse the full catalog tree, choose a database or schema context for queries, and insert object names into the active SQL cell.
 - Use a local Ollama server to generate SQL from natural language and optimize existing SQL queries.
+- Connect to Apache Ignite 2.x / GridGain 8.x through the thin client path, and to Apache Ignite 3.x / GridGain 9.x through the JDBC path.
 - Import JSON from public REST APIs into MariaDB/MySQL with a separate CLI application that flattens payload fields into table columns, including endpoints such as the Jolpica Ergast-compatible API.
 - Execute SQL in notebook-style cells and inspect result sets or command metadata.
 - Run multiple SQL statements in one cell.

@@ -56,7 +56,7 @@ if (clientDistPath) {
   app.use(express.static(clientDistPath));
 }
 
-const databaseTypeSchema = z.enum(["mysql", "mariadb", "postgres", "oracle", "sqlserver", "ignite"]);
+const databaseTypeSchema = z.enum(["mysql", "mariadb", "postgres", "oracle", "sqlserver", "ignite2", "ignite3"]);
 
 const optionalNameSchema = z.preprocess(
   (value) => {
@@ -81,7 +81,7 @@ const connectionSchema = z
     selectedDatabase: optionalNameSchema,
   })
   .superRefine((input, context) => {
-    if (input.type !== "ignite" && input.user.trim().length === 0) {
+    if (input.type !== "ignite2" && input.type !== "ignite3" && input.user.trim().length === 0) {
       context.addIssue({
         code: z.ZodIssueCode.custom,
         path: ["user"],

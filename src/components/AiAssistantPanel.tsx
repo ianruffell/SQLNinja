@@ -27,6 +27,7 @@ type AiAssistantPanelProps = {
   onToggleCollapse: () => void;
   onModelChange: (model: string | null) => void;
   onPromptChange: (prompt: string) => void;
+  onClearContext: () => void;
   onRefreshModels: () => void;
   onGenerate: () => void;
 };
@@ -37,12 +38,16 @@ export function AiAssistantPanel({
   onToggleCollapse,
   onModelChange,
   onPromptChange,
+  onClearContext,
   onRefreshModels,
   onGenerate,
 }: AiAssistantPanelProps) {
   const ollamaHost = formatOllamaHost(workspace.aiBaseUrl);
   const isRefreshingModels = workspace.aiStatus === "loading" && workspace.aiMessage.startsWith("Loading Ollama models");
   const recentHistory = workspace.aiHistory.slice(-3).reverse();
+  const canClearContext =
+    workspace.aiStatus !== "loading" &&
+    (workspace.aiPrompt.trim().length > 0 || workspace.aiNotes.trim().length > 0 || workspace.aiHistory.length > 0);
 
   return (
     <section className="card ai-card">
@@ -101,6 +106,9 @@ export function AiAssistantPanel({
               disabled={!workspace.aiSelectedModel || workspace.aiStatus === "loading"}
             >
               Apply Request
+            </button>
+            <button className="ghost-button" type="button" onClick={onClearContext} disabled={!canClearContext}>
+              Clear Context
             </button>
           </div>
 
